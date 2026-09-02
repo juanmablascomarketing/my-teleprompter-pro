@@ -82,6 +82,9 @@ function RecordPage() {
   const [perm, setPerm] = useState<PermState>("idle");
   const [permMsg, setPermMsg] = useState("");
   const [audioError, setAudioError] = useState("");
+  const [videoInfo, setVideoInfo] = useState("");
+  const [audioLabel, setAudioLabel] = useState("");
+  const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
 
   const [scrolling, setScrolling] = useState(false);
   const [recording, setRecording] = useState(false);
@@ -113,68 +116,105 @@ function RecordPage() {
     setPrefs(loadPrefs());
   }, [id, router]);
 
-  const startCamera = useCallback(async (_facing: "user" | "environment") => {
-    const videoConstraints: MediaStreamConstraints = { video: true };
-    const audioConstraints: MediaStreamConstraints = { audio: true };
-
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    streamRef.current = null;
-    setPerm("idle");
-    setPermMsg("");
-    setAudioError("");
-
-    let videoStream: MediaStream;
+  const refreshDevices = useCallback(async () => {
     try {
-      videoStream = await navigator.mediaDevices.getUserMedia(videoConstraints);
+      const list = await navigator.mediaDevices.enumerateDevices();
+      setAudioDevices(list.filter((d) => d.kind === "audioinput"));
     } catch (err) {
-      const details = mediaErrorDetails(err);
-      console.error("[Cámara] getUserMedia({ video: true }) falló", {
-        constraints: videoConstraints,
-        error: err,
-        details,
-      });
-      const name = err instanceof DOMException || err instanceof Error ? err.name : "";
-      setPerm(name === "NotAllowedError" || name === "SecurityError" ? "denied" : "error");
-      setPermMsg(details);
-      return;
+      console.error("[Audio] enumerateDevices falló", err);
     }
-
-    let audioStream: MediaStream | null = null;
-    try {
-      audioStream = await navigator.mediaDevices.getUserMedia(audioConstraints);
-    } catch (err) {
-      const details = mediaErrorDetails(err);
-      console.error("[Micrófono] getUserMedia({ audio: true }) falló", {
-        constraints: audioConstraints,
-        error: err,
-        details,
-      });
-      setAudioError(details);
-    }
-
-    const stream = new MediaStream([
-      ...videoStream.getVideoTracks(),
-      ...(audioStream?.getAudioTracks() ?? []),
-    ]);
-    streamRef.current = stream;
-    if (videoRef.current) {
-      videoRef.current.srcObject = stream;
-      try {
-        await videoRef.current.play();
-      } catch (err) {
-        console.error("[Cámara] El vídeo no pudo reproducirse", err);
-      }
-    }
-    setPerm("ready");
   }, []);
+
+  const startCamera = useCallback(
+    async (facing: "user" | "environment", audioDeviceId: string) => {
+      const videoConstraints: MediaStreamConstraints = {
+        video: {
+          facingMode: facing,
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+          frameRate: { ideal: 30 },
+        },
+      };
+      const audioConstraints: MediaStreamConstraints = {
+        audio: {
+          ...(audioDeviceId ? { deviceId: { exact: audioDeviceId } } : {}),
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
+      };
+
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+      setPerm("idle");
+      setPermMsg("");
+      setAudioError("");
+      setVideoInfo("");
+      setAudioLabel("");
+
+      let videoStream: MediaStream;
+      try {
+        videoStream = await navigator.mediaDevices.getUserMedia(videoConstraints);
+      } catch (err) {
+        const details = mediaErrorDetails(err);
+        console.error("[Cámara] getUserMedia falló", { constraints: videoConstraints, err });
+        const name = err instanceof DOMException || err instanceof Error ? err.name : "";
+        setPerm(name === "NotAllowedError" || name === "SecurityError" ? "denied" : "error");
+        setPermMsg(details);
+        return;
+      }
+
+      let audioStream: MediaStream | null = null;
+      try {
+        audioStream = await navigator.mediaDevices.getUserMedia(audioConstraints);
+      } catch (err) {
+        const details = mediaErrorDetails(err);
+        console.error("[Micrófono] getUserMedia falló", { constraints: audioConstraints, err });
+        setAudioError(details);
+      }
+
+      const stream = new MediaStream([
+        ...videoStream.getVideoTracks(),
+        ...(audioStream?.getAudioTracks() ?? []),
+      ]);
+      streamRef.current = stream;
+
+      const vs = stream.getVideoTracks()[0]?.getSettings();
+      if (vs) {
+        setVideoInfo(`${vs.width ?? "?"}×${vs.height ?? "?"} @ ${Math.round(vs.frameRate ?? 0)}fps`);
+      }
+      const at = stream.getAudioTracks()[0];
+      if (at) setAudioLabel(at.label || "Micrófono predeterminado");
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        try {
+          await videoRef.current.play();
+        } catch (err) {
+          console.error("[Cámara] El vídeo no pudo reproducirse", err);
+        }
+      }
+      setPerm("ready");
+      refreshDevices();
+    },
+    [refreshDevices],
+  );
 
   useEffect(() => {
     const p = loadPrefs();
-    startCamera(p.facingMode);
+    startCamera(p.facingMode, p.audioDeviceId);
     return () => {
       streamRef.current?.getTracks().forEach((t) => t.stop());
     };
   }, [startCamera]);
+
+  useEffect(() => {
+    const onChange = () => refreshDevices();
+    navigator.mediaDevices?.addEventListener("devicechange", onChange);
+    refreshDevices();
+    return () => navigator.mediaDevices?.removeEventListener("devicechange", onChange);
+  }, [refreshDevices]);
+
 
   // Auto-scroll loop
   useEffect(() => {
