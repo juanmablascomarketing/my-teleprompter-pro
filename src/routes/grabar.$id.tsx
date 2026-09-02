@@ -411,7 +411,7 @@ function RecordPage() {
             onClick={() => {
               const next = prefs.facingMode === "user" ? "environment" : "user";
               updatePrefs({ facingMode: next });
-              startCamera(next);
+              startCamera(next, prefs.audioDeviceId);
             }}
           >
             <SwitchCamera className="size-5" />
