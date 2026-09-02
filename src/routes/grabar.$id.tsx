@@ -306,7 +306,11 @@ function RecordPage() {
     const mimeType = pickMime();
     setDownloadExt(mimeType?.includes("mp4") ? "mp4" : "webm");
     chunksRef.current = [];
-    const rec = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+    const rec = new MediaRecorder(stream, {
+      ...(mimeType ? { mimeType } : {}),
+      videoBitsPerSecond: 8_000_000,
+      audioBitsPerSecond: 192_000,
+    });
     rec.ondataavailable = (e) => {
       if (e.data.size > 0) chunksRef.current.push(e.data);
     };
