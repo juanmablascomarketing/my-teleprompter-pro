@@ -445,7 +445,7 @@ function RecordPage() {
             </p>
             <Button
               className="mt-5 h-12 w-full rounded-2xl font-bold"
-              onClick={() => startCamera(prefs.facingMode)}
+              onClick={() => startCamera(prefs.facingMode, prefs.audioDeviceId)}
             >
               Reintentar
             </Button>
