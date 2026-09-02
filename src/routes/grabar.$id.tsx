@@ -385,7 +385,7 @@ function RecordPage() {
                 min={8}
                 max={160}
                 step={2}
-                onValueChange={([v]) => updatePrefs({ speed: v })}
+                onValueChange={(v) => updatePrefs({ speed: v[0] ?? prefs.speed })}
                 className="flex-1"
               />
               <span className="w-12 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
@@ -400,7 +400,7 @@ function RecordPage() {
                 min={16}
                 max={72}
                 step={1}
-                onValueChange={([v]) => updatePrefs({ fontSize: v })}
+                onValueChange={(v) => updatePrefs({ fontSize: v[0] ?? prefs.fontSize })}
                 className="flex-1"
               />
               <span className="w-12 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
