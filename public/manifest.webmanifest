@@ -1,0 +1,31 @@
+{
+  "name": "Teleprompter Personal",
+  "short_name": "Teleprompter",
+  "description": "Graba vídeos con la cámara del móvil mientras lees tu guion en un teleprompter superpuesto.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#12151c",
+  "theme_color": "#12151c",
+  "icons": [
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
