@@ -131,8 +131,8 @@ function RecordPage() {
       const videoConstraints: MediaStreamConstraints = {
         video: {
           facingMode: facing,
-          width: { ideal: 1920 },
-          height: { ideal: 1080 },
+          width: { ideal: 3840 },
+          height: { ideal: 2160 },
           frameRate: { ideal: 30 },
         },
       };
@@ -307,9 +307,16 @@ function RecordPage() {
     const mimeType = pickMime();
     setDownloadExt(mimeType?.includes("mp4") ? "mp4" : "webm");
     chunksRef.current = [];
+    const vset = stream.getVideoTracks()[0]?.getSettings();
+    const pixels = (vset?.width ?? 1920) * (vset?.height ?? 1080);
+    const fps = vset?.frameRate ?? 30;
+    const videoBitsPerSecond = Math.min(
+      40_000_000,
+      Math.max(8_000_000, Math.round(pixels * fps * 0.1)),
+    );
     const rec = new MediaRecorder(stream, {
       ...(mimeType ? { mimeType } : {}),
-      videoBitsPerSecond: 8_000_000,
+      videoBitsPerSecond,
       audioBitsPerSecond: 192_000,
     });
     rec.ondataavailable = (e) => {
