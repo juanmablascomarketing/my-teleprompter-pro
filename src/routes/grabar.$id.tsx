@@ -11,6 +11,7 @@ import {
   SwitchCamera,
   Type,
   Gauge,
+  Mic,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
@@ -82,6 +83,9 @@ function RecordPage() {
   const [perm, setPerm] = useState<PermState>("idle");
   const [permMsg, setPermMsg] = useState("");
   const [audioError, setAudioError] = useState("");
+  const [videoInfo, setVideoInfo] = useState("");
+  const [audioLabel, setAudioLabel] = useState("");
+  const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
 
   const [scrolling, setScrolling] = useState(false);
   const [recording, setRecording] = useState(false);
@@ -113,68 +117,105 @@ function RecordPage() {
     setPrefs(loadPrefs());
   }, [id, router]);
 
-  const startCamera = useCallback(async (_facing: "user" | "environment") => {
-    const videoConstraints: MediaStreamConstraints = { video: true };
-    const audioConstraints: MediaStreamConstraints = { audio: true };
-
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    streamRef.current = null;
-    setPerm("idle");
-    setPermMsg("");
-    setAudioError("");
-
-    let videoStream: MediaStream;
+  const refreshDevices = useCallback(async () => {
     try {
-      videoStream = await navigator.mediaDevices.getUserMedia(videoConstraints);
+      const list = await navigator.mediaDevices.enumerateDevices();
+      setAudioDevices(list.filter((d) => d.kind === "audioinput"));
     } catch (err) {
-      const details = mediaErrorDetails(err);
-      console.error("[Cámara] getUserMedia({ video: true }) falló", {
-        constraints: videoConstraints,
-        error: err,
-        details,
-      });
-      const name = err instanceof DOMException || err instanceof Error ? err.name : "";
-      setPerm(name === "NotAllowedError" || name === "SecurityError" ? "denied" : "error");
-      setPermMsg(details);
-      return;
+      console.error("[Audio] enumerateDevices falló", err);
     }
-
-    let audioStream: MediaStream | null = null;
-    try {
-      audioStream = await navigator.mediaDevices.getUserMedia(audioConstraints);
-    } catch (err) {
-      const details = mediaErrorDetails(err);
-      console.error("[Micrófono] getUserMedia({ audio: true }) falló", {
-        constraints: audioConstraints,
-        error: err,
-        details,
-      });
-      setAudioError(details);
-    }
-
-    const stream = new MediaStream([
-      ...videoStream.getVideoTracks(),
-      ...(audioStream?.getAudioTracks() ?? []),
-    ]);
-    streamRef.current = stream;
-    if (videoRef.current) {
-      videoRef.current.srcObject = stream;
-      try {
-        await videoRef.current.play();
-      } catch (err) {
-        console.error("[Cámara] El vídeo no pudo reproducirse", err);
-      }
-    }
-    setPerm("ready");
   }, []);
+
+  const startCamera = useCallback(
+    async (facing: "user" | "environment", audioDeviceId: string) => {
+      const videoConstraints: MediaStreamConstraints = {
+        video: {
+          facingMode: facing,
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+          frameRate: { ideal: 30 },
+        },
+      };
+      const audioConstraints: MediaStreamConstraints = {
+        audio: {
+          ...(audioDeviceId ? { deviceId: { exact: audioDeviceId } } : {}),
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
+      };
+
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+      setPerm("idle");
+      setPermMsg("");
+      setAudioError("");
+      setVideoInfo("");
+      setAudioLabel("");
+
+      let videoStream: MediaStream;
+      try {
+        videoStream = await navigator.mediaDevices.getUserMedia(videoConstraints);
+      } catch (err) {
+        const details = mediaErrorDetails(err);
+        console.error("[Cámara] getUserMedia falló", { constraints: videoConstraints, err });
+        const name = err instanceof DOMException || err instanceof Error ? err.name : "";
+        setPerm(name === "NotAllowedError" || name === "SecurityError" ? "denied" : "error");
+        setPermMsg(details);
+        return;
+      }
+
+      let audioStream: MediaStream | null = null;
+      try {
+        audioStream = await navigator.mediaDevices.getUserMedia(audioConstraints);
+      } catch (err) {
+        const details = mediaErrorDetails(err);
+        console.error("[Micrófono] getUserMedia falló", { constraints: audioConstraints, err });
+        setAudioError(details);
+      }
+
+      const stream = new MediaStream([
+        ...videoStream.getVideoTracks(),
+        ...(audioStream?.getAudioTracks() ?? []),
+      ]);
+      streamRef.current = stream;
+
+      const vs = stream.getVideoTracks()[0]?.getSettings();
+      if (vs) {
+        setVideoInfo(`${vs.width ?? "?"}×${vs.height ?? "?"} @ ${Math.round(vs.frameRate ?? 0)}fps`);
+      }
+      const at = stream.getAudioTracks()[0];
+      if (at) setAudioLabel(at.label || "Micrófono predeterminado");
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        try {
+          await videoRef.current.play();
+        } catch (err) {
+          console.error("[Cámara] El vídeo no pudo reproducirse", err);
+        }
+      }
+      setPerm("ready");
+      refreshDevices();
+    },
+    [refreshDevices],
+  );
 
   useEffect(() => {
     const p = loadPrefs();
-    startCamera(p.facingMode);
+    startCamera(p.facingMode, p.audioDeviceId);
     return () => {
       streamRef.current?.getTracks().forEach((t) => t.stop());
     };
   }, [startCamera]);
+
+  useEffect(() => {
+    const onChange = () => refreshDevices();
+    navigator.mediaDevices?.addEventListener("devicechange", onChange);
+    refreshDevices();
+    return () => navigator.mediaDevices?.removeEventListener("devicechange", onChange);
+  }, [refreshDevices]);
+
 
   // Auto-scroll loop
   useEffect(() => {
@@ -266,7 +307,11 @@ function RecordPage() {
     const mimeType = pickMime();
     setDownloadExt(mimeType?.includes("mp4") ? "mp4" : "webm");
     chunksRef.current = [];
-    const rec = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+    const rec = new MediaRecorder(stream, {
+      ...(mimeType ? { mimeType } : {}),
+      videoBitsPerSecond: 8_000_000,
+      audioBitsPerSecond: 192_000,
+    });
     rec.ondataavailable = (e) => {
       if (e.data.size > 0) chunksRef.current.push(e.data);
     };
@@ -371,7 +416,7 @@ function RecordPage() {
             onClick={() => {
               const next = prefs.facingMode === "user" ? "environment" : "user";
               updatePrefs({ facingMode: next });
-              startCamera(next);
+              startCamera(next, prefs.audioDeviceId);
             }}
           >
             <SwitchCamera className="size-5" />
@@ -405,7 +450,7 @@ function RecordPage() {
             </p>
             <Button
               className="mt-5 h-12 w-full rounded-2xl font-bold"
-              onClick={() => startCamera(prefs.facingMode)}
+              onClick={() => startCamera(prefs.facingMode, prefs.audioDeviceId)}
             >
               Reintentar
             </Button>
@@ -422,6 +467,14 @@ function RecordPage() {
           <pre className="mt-2 whitespace-pre-wrap break-words text-xs text-foreground">
             {audioError}
           </pre>
+        </div>
+      )}
+
+      {perm === "ready" && (videoInfo || audioLabel) && (
+        <div className="pointer-events-none absolute inset-x-3 top-[calc(env(safe-area-inset-top,0px)+3.75rem)] z-10 flex justify-center">
+          <span className="max-w-full truncate rounded-full bg-glass-strong px-3 py-1 text-[11px] text-muted-foreground backdrop-blur">
+            {videoInfo} · {audioLabel}
+          </span>
         </div>
       )}
 
@@ -458,6 +511,31 @@ function RecordPage() {
               <span className="w-12 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
                 {prefs.fontSize}px
               </span>
+            </div>
+            <div className="mt-4 flex items-center gap-3">
+              <Mic className="size-5 shrink-0 text-primary" />
+              <select
+                aria-label="Micrófono"
+                disabled={recording || countdown !== null}
+                value={prefs.audioDeviceId}
+                onChange={(e) => {
+                  const value = e.target.value;
+                  updatePrefs({ audioDeviceId: value });
+                  startCamera(prefs.facingMode, value);
+                }}
+                className="min-w-0 flex-1 rounded-xl border border-border bg-card px-3 py-2 text-sm text-foreground disabled:opacity-40"
+              >
+                <option value="">Micrófono predeterminado</option>
+                {audioDevices.map((d, i) => (
+                  <option key={d.deviceId} value={d.deviceId}>
+                    {d.label || `Micrófono ${i + 1}`}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="mt-3 space-y-1 text-xs text-muted-foreground">
+              <p>Vídeo: {videoInfo || "—"}</p>
+              <p className="truncate">Micrófono: {audioLabel || "—"}</p>
             </div>
           </div>
         )}
