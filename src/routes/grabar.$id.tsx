@@ -44,6 +44,13 @@ export const Route = createFileRoute("/grabar/$id")({
 
 type PermState = "idle" | "ready" | "denied" | "error";
 
+function mediaErrorDetails(error: unknown) {
+  if (error instanceof DOMException || error instanceof Error) {
+    return `${error.name}: ${error.message || "Sin mensaje adicional"}`;
+  }
+  return `Error desconocido: ${String(error)}`;
+}
+
 function fmt(sec: number) {
   const m = Math.floor(sec / 60)
     .toString()
@@ -74,6 +81,7 @@ function RecordPage() {
   const [prefs, setPrefs] = useState<Prefs>(defaultPrefs);
   const [perm, setPerm] = useState<PermState>("idle");
   const [permMsg, setPermMsg] = useState("");
+  const [audioError, setAudioError] = useState("");
 
   const [scrolling, setScrolling] = useState(false);
   const [recording, setRecording] = useState(false);
@@ -105,36 +113,59 @@ function RecordPage() {
     setPrefs(loadPrefs());
   }, [id, router]);
 
-  const startCamera = useCallback(async (facing: "user" | "environment") => {
+  const startCamera = useCallback(async (_facing: "user" | "environment") => {
+    const videoConstraints: MediaStreamConstraints = { video: true };
+    const audioConstraints: MediaStreamConstraints = { audio: true };
+
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    setPerm("idle");
+    setPermMsg("");
+    setAudioError("");
+
+    let videoStream: MediaStream;
     try {
-      streamRef.current?.getTracks().forEach((t) => t.stop());
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } },
-        audio: true,
-      });
-      streamRef.current = stream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play().catch(() => {});
-      }
-      setPerm("ready");
+      videoStream = await navigator.mediaDevices.getUserMedia(videoConstraints);
     } catch (err) {
-      const e = err as DOMException;
-      if (e?.name === "NotAllowedError" || e?.name === "SecurityError") {
-        setPerm("denied");
-        setPermMsg(
-          "Has denegado el acceso a cámara o micrófono. Ábrelo en el candado de la barra de direcciones (o Ajustes › Safari/Chrome › Cámara y Micrófono) y recarga la página.",
-        );
-      } else if (e?.name === "NotFoundError") {
-        setPerm("error");
-        setPermMsg("No se ha encontrado ninguna cámara disponible en este dispositivo.");
-      } else {
-        setPerm("error");
-        setPermMsg(
-          "No se pudo iniciar la cámara. Comprueba que ninguna otra app la esté usando y vuelve a intentarlo.",
-        );
+      const details = mediaErrorDetails(err);
+      console.error("[Cámara] getUserMedia({ video: true }) falló", {
+        constraints: videoConstraints,
+        error: err,
+        details,
+      });
+      const name = err instanceof DOMException || err instanceof Error ? err.name : "";
+      setPerm(name === "NotAllowedError" || name === "SecurityError" ? "denied" : "error");
+      setPermMsg(details);
+      return;
+    }
+
+    let audioStream: MediaStream | null = null;
+    try {
+      audioStream = await navigator.mediaDevices.getUserMedia(audioConstraints);
+    } catch (err) {
+      const details = mediaErrorDetails(err);
+      console.error("[Micrófono] getUserMedia({ audio: true }) falló", {
+        constraints: audioConstraints,
+        error: err,
+        details,
+      });
+      setAudioError(details);
+    }
+
+    const stream = new MediaStream([
+      ...videoStream.getVideoTracks(),
+      ...(audioStream?.getAudioTracks() ?? []),
+    ]);
+    streamRef.current = stream;
+    if (videoRef.current) {
+      videoRef.current.srcObject = stream;
+      try {
+        await videoRef.current.play();
+      } catch (err) {
+        console.error("[Cámara] El vídeo no pudo reproducirse", err);
       }
     }
+    setPerm("ready");
   }, []);
 
   useEffect(() => {
@@ -361,8 +392,17 @@ function RecordPage() {
       {(perm === "denied" || perm === "error") && (
         <div className="absolute inset-0 grid place-items-center bg-background/95 safe-x">
           <div className="max-w-sm rounded-3xl border border-border bg-card p-6 text-center">
-            <h2 className="text-lg font-bold">Necesitamos la cámara y el micrófono</h2>
-            <p className="mt-2 text-sm text-muted-foreground">{permMsg}</p>
+            <h2 className="text-lg font-bold">Error real de cámara</h2>
+            <p className="mt-2 text-sm text-muted-foreground">
+              Petición ejecutada: <code>getUserMedia({"{ video: true }"})</code>
+            </p>
+            <pre className="mt-3 whitespace-pre-wrap break-words rounded-lg bg-muted p-3 text-left text-xs text-foreground">
+              {permMsg}
+            </pre>
+            <p className="mt-3 text-xs text-muted-foreground">
+              Revisa el permiso de cámara en el candado de la barra de direcciones o en los ajustes
+              del navegador.
+            </p>
             <Button
               className="mt-5 h-12 w-full rounded-2xl font-bold"
               onClick={() => startCamera(prefs.facingMode)}
@@ -370,6 +410,18 @@ function RecordPage() {
               Reintentar
             </Button>
           </div>
+        </div>
+      )}
+
+      {perm === "ready" && audioError && (
+        <div className="absolute inset-x-3 top-20 z-10 rounded-lg border border-border bg-card p-3 text-sm shadow-lg">
+          <p className="font-bold">La cámara funciona, pero el micrófono ha fallado</p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Petición: <code>getUserMedia({"{ audio: true }"})</code>
+          </p>
+          <pre className="mt-2 whitespace-pre-wrap break-words text-xs text-foreground">
+            {audioError}
+          </pre>
         </div>
       )}
 
