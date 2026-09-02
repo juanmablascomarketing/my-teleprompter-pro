@@ -470,6 +470,14 @@ function RecordPage() {
         </div>
       )}
 
+      {perm === "ready" && (videoInfo || audioLabel) && (
+        <div className="pointer-events-none absolute inset-x-3 top-[calc(env(safe-area-inset-top,0px)+3.75rem)] z-10 flex justify-center">
+          <span className="max-w-full truncate rounded-full bg-glass-strong px-3 py-1 text-[11px] text-muted-foreground backdrop-blur">
+            {videoInfo} · {audioLabel}
+          </span>
+        </div>
+      )}
+
       {/* Bottom controls */}
       <div className="absolute inset-x-0 bottom-0 safe-bottom safe-x">
         {showPanel && (
