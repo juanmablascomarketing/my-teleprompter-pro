@@ -103,22 +103,11 @@ function ScriptsPage() {
 
       {scripts.length === 0 ? (
         <div className="mt-10 rounded-3xl border border-dashed border-border bg-card/50 p-8 text-center">
-          <h2 className="text-lg font-bold">
-            Si compras una trufa negra y esperas que huela a tres metros de distancia, probablemente te han enseñado mal lo que es una trufa.
-
-            Una buena Tuber melanosporum tiene aroma, por supuesto. Pero su aroma natural es complejo, cambia con la maduración, la temperatura y la propia pieza.
-
-            El problema es que durante años muchos consumidores se han acostumbrado a productos con aromas añadidos extremadamente potentes.
-
-            Después huelen una trufa real y dicen: ‘Pues no huele tanto’.
-
-            Exactamente.
-
-            Porque una cosa es una trufa y otra un aroma diseñado para darte un golpe en la nariz.
-
-            Si quieres aprender a distinguirlo, durante los próximos vídeos te voy a enseñar cómo lo hacemos nosotros.
-          </h2>
-          <p className="mt-2 text-sm text-muted-foreground">{"\n"}</p>
+          <h2 className="text-lg font-bold">Aún no hay guiones</h2>
+          <p className="mt-2 text-sm text-muted-foreground">
+            Crea uno pegando tu texto y grábate leyéndolo con el teleprompter sobre la
+            cámara.
+          </p>
         </div>
       ) : (
         <ul className="flex flex-col gap-3">
