@@ -131,8 +131,8 @@ function RecordPage() {
       const videoConstraints: MediaStreamConstraints = {
         video: {
           facingMode: facing,
-          width: { ideal: 1920 },
-          height: { ideal: 1080 },
+          width: { ideal: 3840 },
+          height: { ideal: 2160 },
           frameRate: { ideal: 30 },
         },
       };
