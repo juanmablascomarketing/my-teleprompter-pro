@@ -13,6 +13,7 @@ export type Prefs = {
   speed: number;
   fontSize: number;
   mirror: boolean;
+  audioDeviceId: string;
 };
 
 export const defaultPrefs: Prefs = {
@@ -20,6 +21,7 @@ export const defaultPrefs: Prefs = {
   speed: 40,
   fontSize: 30,
   mirror: false,
+  audioDeviceId: "",
 };
 
 function isBrowser() {
