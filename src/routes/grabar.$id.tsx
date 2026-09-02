@@ -1,0 +1,491 @@
+import { createFileRoute, useRouter } from "@tanstack/react-router";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  ArrowLeft,
+  Download,
+  FlipHorizontal2,
+  Pause,
+  Play,
+  RotateCcw,
+  Square,
+  SwitchCamera,
+  Type,
+  Gauge,
+} from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Slider } from "@/components/ui/slider";
+import {
+  defaultPrefs,
+  getScript,
+  loadPrefs,
+  savePrefs,
+  type Prefs,
+  type Script,
+} from "@/lib/scripts-store";
+
+export const Route = createFileRoute("/grabar/$id")({
+  head: () => ({
+    meta: [
+      { title: "Grabar con teleprompter — Teleprompter Personal" },
+      {
+        name: "description",
+        content:
+          "Vista de cámara a pantalla completa con tu guion en scroll automático, velocidad ajustable, modo espejo y grabación descargable.",
+      },
+      { property: "og:title", content: "Grabar con teleprompter" },
+      {
+        property: "og:description",
+        content: "Cámara en directo con el guion superpuesto en scroll automático.",
+      },
+    ],
+  }),
+  component: RecordPage,
+});
+
+type PermState = "idle" | "ready" | "denied" | "error";
+
+function fmt(sec: number) {
+  const m = Math.floor(sec / 60)
+    .toString()
+    .padStart(2, "0");
+  const s = Math.floor(sec % 60)
+    .toString()
+    .padStart(2, "0");
+  return `${m}:${s}`;
+}
+
+function pickMime() {
+  if (typeof MediaRecorder === "undefined") return undefined;
+  const candidates = [
+    "video/mp4;codecs=avc1,mp4a.40.2",
+    "video/mp4",
+    "video/webm;codecs=vp9,opus",
+    "video/webm;codecs=vp8,opus",
+    "video/webm",
+  ];
+  return candidates.find((t) => MediaRecorder.isTypeSupported(t));
+}
+
+function RecordPage() {
+  const { id } = Route.useParams();
+  const router = useRouter();
+
+  const [script, setScript] = useState<Script | null>(null);
+  const [prefs, setPrefs] = useState<Prefs>(defaultPrefs);
+  const [perm, setPerm] = useState<PermState>("idle");
+  const [permMsg, setPermMsg] = useState("");
+
+  const [scrolling, setScrolling] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const [countdown, setCountdown] = useState<number | null>(null);
+  const [elapsed, setElapsed] = useState(0);
+  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+  const [downloadExt, setDownloadExt] = useState("webm");
+  const [showPanel, setShowPanel] = useState(true);
+
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const trackRef = useRef<HTMLDivElement>(null);
+  const offsetRef = useRef(0);
+  const rafRef = useRef<number | null>(null);
+  const lastTsRef = useRef(0);
+  const wakeRef = useRef<WakeLockSentinel | null>(null);
+  const speedRef = useRef(prefs.speed);
+  speedRef.current = prefs.speed;
+
+  useEffect(() => {
+    const s = getScript(id);
+    if (!s) {
+      router.navigate({ to: "/" });
+      return;
+    }
+    setScript(s);
+    setPrefs(loadPrefs());
+  }, [id, router]);
+
+  const startCamera = useCallback(async (facing: "user" | "environment") => {
+    try {
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: true,
+      });
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play().catch(() => {});
+      }
+      setPerm("ready");
+    } catch (err) {
+      const e = err as DOMException;
+      if (e?.name === "NotAllowedError" || e?.name === "SecurityError") {
+        setPerm("denied");
+        setPermMsg(
+          "Has denegado el acceso a cámara o micrófono. Ábrelo en el candado de la barra de direcciones (o Ajustes › Safari/Chrome › Cámara y Micrófono) y recarga la página.",
+        );
+      } else if (e?.name === "NotFoundError") {
+        setPerm("error");
+        setPermMsg("No se ha encontrado ninguna cámara disponible en este dispositivo.");
+      } else {
+        setPerm("error");
+        setPermMsg(
+          "No se pudo iniciar la cámara. Comprueba que ninguna otra app la esté usando y vuelve a intentarlo.",
+        );
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    const p = loadPrefs();
+    startCamera(p.facingMode);
+    return () => {
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+    };
+  }, [startCamera]);
+
+  // Auto-scroll loop
+  useEffect(() => {
+    if (!scrolling) {
+      lastTsRef.current = 0;
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+      return;
+    }
+    const step = (ts: number) => {
+      if (!lastTsRef.current) lastTsRef.current = ts;
+      const dt = (ts - lastTsRef.current) / 1000;
+      lastTsRef.current = ts;
+      offsetRef.current += speedRef.current * dt;
+      const el = trackRef.current;
+      if (el) {
+        const max = el.scrollHeight + 40;
+        if (offsetRef.current > max) offsetRef.current = max;
+        el.style.transform = `translate3d(0, ${-offsetRef.current}px, 0)`;
+      }
+      rafRef.current = requestAnimationFrame(step);
+    };
+    rafRef.current = requestAnimationFrame(step);
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    };
+  }, [scrolling]);
+
+  // Recording timer
+  useEffect(() => {
+    if (!recording) return;
+    const t = window.setInterval(() => setElapsed((e) => e + 1), 1000);
+    return () => window.clearInterval(t);
+  }, [recording]);
+
+  const releaseWakeLock = useCallback(async () => {
+    try {
+      await wakeRef.current?.release();
+    } catch {
+      /* ignore */
+    }
+    wakeRef.current = null;
+  }, []);
+
+  const requestWakeLock = useCallback(async () => {
+    try {
+      if ("wakeLock" in navigator) {
+        wakeRef.current = await navigator.wakeLock.request("screen");
+      }
+    } catch {
+      /* not critical */
+    }
+  }, []);
+
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState === "visible" && recording) requestWakeLock();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, [recording, requestWakeLock]);
+
+  useEffect(() => () => void releaseWakeLock(), [releaseWakeLock]);
+
+  function resetScroll() {
+    offsetRef.current = 0;
+    if (trackRef.current) trackRef.current.style.transform = "translate3d(0,0,0)";
+  }
+
+  function updatePrefs(patch: Partial<Prefs>) {
+    setPrefs((p) => ({ ...p, ...patch }));
+    savePrefs(patch);
+  }
+
+  async function beginRecording() {
+    const stream = streamRef.current;
+    if (!stream) return;
+    if (downloadUrl) URL.revokeObjectURL(downloadUrl);
+    setDownloadUrl(null);
+    resetScroll();
+    setShowPanel(false);
+
+    for (let i = 3; i > 0; i--) {
+      setCountdown(i);
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    setCountdown(null);
+
+    const mimeType = pickMime();
+    setDownloadExt(mimeType?.includes("mp4") ? "mp4" : "webm");
+    chunksRef.current = [];
+    const rec = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+    rec.ondataavailable = (e) => {
+      if (e.data.size > 0) chunksRef.current.push(e.data);
+    };
+    rec.onstop = () => {
+      const blob = new Blob(chunksRef.current, { type: mimeType ?? "video/webm" });
+      setDownloadUrl(URL.createObjectURL(blob));
+    };
+    recorderRef.current = rec;
+    rec.start(1000);
+    setElapsed(0);
+    setRecording(true);
+    setScrolling(true);
+    requestWakeLock();
+  }
+
+  function stopRecording() {
+    recorderRef.current?.stop();
+    recorderRef.current = null;
+    setRecording(false);
+    setScrolling(false);
+    setShowPanel(true);
+    releaseWakeLock();
+  }
+
+  const title = script?.title ?? "";
+
+  return (
+    <main className="fixed inset-0 overflow-hidden bg-black">
+      <video
+        ref={videoRef}
+        playsInline
+        muted
+        autoPlay
+        className="absolute inset-0 size-full object-cover"
+        style={{ transform: prefs.facingMode === "user" ? "scaleX(-1)" : undefined }}
+      />
+
+      {/* Teleprompter overlay */}
+      <div
+        onClick={() => recording && setScrolling((s) => !s)}
+        className="absolute inset-x-0 top-0 h-[58svh] cursor-pointer"
+      >
+        <div className="absolute inset-x-2 top-[calc(env(safe-area-inset-top,0px)+4rem)] bottom-3 overflow-hidden rounded-3xl bg-glass-strong backdrop-blur-[2px] prompter-fade">
+          <div
+            ref={trackRef}
+            className="px-5 pt-16 pb-24 will-change-transform"
+            style={{
+              transform: "translate3d(0,0,0)",
+              fontSize: `${prefs.fontSize}px`,
+              lineHeight: 1.45,
+              transformOrigin: "center",
+            }}
+          >
+            <div
+              style={{ transform: prefs.mirror ? "scaleX(-1)" : undefined }}
+              className="whitespace-pre-wrap text-center font-semibold text-foreground drop-shadow"
+            >
+              {script?.body}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Top bar */}
+      <div className="absolute inset-x-0 top-0 safe-top safe-x">
+        <div className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2">
+          <Button
+            variant="secondary"
+            size="icon"
+            aria-label="Volver a guiones"
+            className="size-11 shrink-0 rounded-full bg-glass-strong backdrop-blur"
+            onClick={() => {
+              if (recording) stopRecording();
+              router.navigate({ to: "/" });
+            }}
+          >
+            <ArrowLeft className="size-5" />
+          </Button>
+          <div className="min-w-0 text-center">
+            {recording ? (
+              <span className="inline-flex items-center gap-2 rounded-full bg-glass-strong px-3 py-1.5 text-sm font-bold tabular-nums backdrop-blur">
+                <span className="size-2.5 animate-pulse rounded-full bg-rec" />
+                {fmt(elapsed)}
+                {!scrolling && (
+                  <span className="text-xs font-medium text-muted-foreground">
+                    · scroll en pausa
+                  </span>
+                )}
+              </span>
+            ) : (
+              <span className="block truncate rounded-full bg-glass px-3 py-1.5 text-sm font-semibold backdrop-blur">
+                {title}
+              </span>
+            )}
+          </div>
+          <Button
+            variant="secondary"
+            size="icon"
+            aria-label="Cambiar de cámara"
+            disabled={recording || countdown !== null}
+            className="size-11 shrink-0 rounded-full bg-glass-strong backdrop-blur disabled:opacity-40"
+            onClick={() => {
+              const next = prefs.facingMode === "user" ? "environment" : "user";
+              updatePrefs({ facingMode: next });
+              startCamera(next);
+            }}
+          >
+            <SwitchCamera className="size-5" />
+          </Button>
+        </div>
+      </div>
+
+      {/* Countdown */}
+      {countdown !== null && (
+        <div className="absolute inset-0 grid place-items-center bg-black/50">
+          <span className="text-[8rem] font-extrabold text-primary tabular-nums">
+            {countdown}
+          </span>
+        </div>
+      )}
+
+      {/* Permission error */}
+      {(perm === "denied" || perm === "error") && (
+        <div className="absolute inset-0 grid place-items-center bg-background/95 safe-x">
+          <div className="max-w-sm rounded-3xl border border-border bg-card p-6 text-center">
+            <h2 className="text-lg font-bold">Necesitamos la cámara y el micrófono</h2>
+            <p className="mt-2 text-sm text-muted-foreground">{permMsg}</p>
+            <Button
+              className="mt-5 h-12 w-full rounded-2xl font-bold"
+              onClick={() => startCamera(prefs.facingMode)}
+            >
+              Reintentar
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* Bottom controls */}
+      <div className="absolute inset-x-0 bottom-0 safe-bottom safe-x">
+        {showPanel && (
+          <div className="mb-3 rounded-3xl bg-glass-strong p-4 backdrop-blur">
+            <div className="flex items-center gap-3">
+              <Gauge className="size-5 shrink-0 text-primary" />
+              <Slider
+                aria-label="Velocidad de scroll"
+                value={[prefs.speed]}
+                min={8}
+                max={160}
+                step={2}
+                onValueChange={([v]) => updatePrefs({ speed: v })}
+                className="flex-1"
+              />
+              <span className="w-12 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+                {prefs.speed}
+              </span>
+            </div>
+            <div className="mt-4 flex items-center gap-3">
+              <Type className="size-5 shrink-0 text-primary" />
+              <Slider
+                aria-label="Tamaño de fuente"
+                value={[prefs.fontSize]}
+                min={16}
+                max={72}
+                step={1}
+                onValueChange={([v]) => updatePrefs({ fontSize: v })}
+                className="flex-1"
+              />
+              <span className="w-12 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+                {prefs.fontSize}px
+              </span>
+            </div>
+          </div>
+        )}
+
+        <div className="flex items-center justify-between gap-3">
+          <Button
+            variant="secondary"
+            size="icon"
+            aria-label="Reiniciar guion al principio"
+            className="size-14 rounded-full bg-glass-strong backdrop-blur"
+            onClick={resetScroll}
+          >
+            <RotateCcw className="size-6" />
+          </Button>
+
+          <Button
+            variant="secondary"
+            size="icon"
+            aria-label={scrolling ? "Pausar scroll" : "Reanudar scroll"}
+            className="size-14 rounded-full bg-glass-strong backdrop-blur"
+            onClick={() => setScrolling((s) => !s)}
+          >
+            {scrolling ? <Pause className="size-6" /> : <Play className="size-6" />}
+          </Button>
+
+          {recording ? (
+            <Button
+              size="icon"
+              aria-label="Detener grabación"
+              className="size-20 rounded-full bg-rec text-foreground hover:bg-rec/90"
+              onClick={stopRecording}
+            >
+              <Square className="size-8 fill-current" />
+            </Button>
+          ) : (
+            <Button
+              size="icon"
+              aria-label="Empezar a grabar"
+              disabled={perm !== "ready" || countdown !== null}
+              className="size-20 rounded-full border-4 border-foreground/70 bg-rec text-foreground hover:bg-rec/90"
+              onClick={beginRecording}
+            >
+              <span className="size-7 rounded-full bg-foreground" />
+            </Button>
+          )}
+
+          <Button
+            variant="secondary"
+            size="icon"
+            aria-label="Modo espejo"
+            className={`size-14 rounded-full backdrop-blur ${
+              prefs.mirror ? "bg-primary text-primary-foreground" : "bg-glass-strong"
+            }`}
+            onClick={() => updatePrefs({ mirror: !prefs.mirror })}
+          >
+            <FlipHorizontal2 className="size-6" />
+          </Button>
+
+          {downloadUrl ? (
+            <a
+              href={downloadUrl}
+              download={`${title || "toma"}.${downloadExt}`}
+              aria-label="Descargar vídeo"
+              className="grid size-14 shrink-0 place-items-center rounded-full bg-primary text-primary-foreground"
+            >
+              <Download className="size-6" />
+            </a>
+          ) : (
+            <Button
+              variant="secondary"
+              size="icon"
+              aria-label="Ajustes de texto"
+              className="size-14 rounded-full bg-glass-strong backdrop-blur"
+              onClick={() => setShowPanel((v) => !v)}
+            >
+              <Type className="size-6" />
+            </Button>
+          )}
+        </div>
+      </div>
+    </main>
+  );
+}
