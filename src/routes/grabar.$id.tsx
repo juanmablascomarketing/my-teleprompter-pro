@@ -503,6 +503,31 @@ function RecordPage() {
                 {prefs.fontSize}px
               </span>
             </div>
+            <div className="mt-4 flex items-center gap-3">
+              <Mic className="size-5 shrink-0 text-primary" />
+              <select
+                aria-label="Micrófono"
+                disabled={recording || countdown !== null}
+                value={prefs.audioDeviceId}
+                onChange={(e) => {
+                  const value = e.target.value;
+                  updatePrefs({ audioDeviceId: value });
+                  startCamera(prefs.facingMode, value);
+                }}
+                className="min-w-0 flex-1 rounded-xl border border-border bg-card px-3 py-2 text-sm text-foreground disabled:opacity-40"
+              >
+                <option value="">Micrófono predeterminado</option>
+                {audioDevices.map((d, i) => (
+                  <option key={d.deviceId} value={d.deviceId}>
+                    {d.label || `Micrófono ${i + 1}`}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="mt-3 space-y-1 text-xs text-muted-foreground">
+              <p>Vídeo: {videoInfo || "—"}</p>
+              <p className="truncate">Micrófono: {audioLabel || "—"}</p>
+            </div>
           </div>
         )}
 
