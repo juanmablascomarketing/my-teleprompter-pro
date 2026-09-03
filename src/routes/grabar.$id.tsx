@@ -98,11 +98,16 @@ function RecordPage() {
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const [downloadExt, setDownloadExt] = useState("webm");
   const [showPanel, setShowPanel] = useState(true);
+  const [recLog, setRecLog] = useState("");
+  const [lowBitrate, setLowBitrate] = useState(false);
+  const [finalizing, setFinalizing] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+  const stoppingRef = useRef(false);
+  const startTsRef = useRef(0);
   const trackRef = useRef<HTMLDivElement>(null);
   const offsetRef = useRef(0);
   const rafRef = useRef<number | null>(null);
