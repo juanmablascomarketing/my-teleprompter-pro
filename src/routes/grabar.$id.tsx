@@ -604,6 +604,12 @@ function RecordPage() {
           </div>
         )}
 
+        {finalizing && (
+          <div className="mb-3 rounded-2xl bg-glass-strong px-4 py-2 text-center text-sm font-semibold backdrop-blur">
+            Cerrando el archivo de vídeo…
+          </div>
+        )}
+
         <div className="flex items-center justify-between gap-3">
           <Button
             variant="secondary"
