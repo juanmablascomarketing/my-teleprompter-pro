@@ -371,7 +371,7 @@ function RecordPage() {
         console.error("[MediaRecorder] chunk vacío", { index: stats.total, timecode: e.timecode });
       } else {
         chunksRef.current.push(e.data);
-        if (e.data.size < 10_240) {
+        if (!stoppingRef.current && e.data.size < 10_240) {
           stats.small += 1;
           console.warn("[MediaRecorder] chunk anormalmente pequeño", {
             index: stats.total,
@@ -580,6 +580,14 @@ function RecordPage() {
         <div className="pointer-events-none absolute inset-x-3 top-[calc(env(safe-area-inset-top,0px)+3.75rem)] z-10 flex justify-center">
           <span className="max-w-full truncate rounded-full bg-glass-strong px-3 py-1 text-[11px] text-muted-foreground backdrop-blur">
             {videoInfo} · {audioLabel}
+          </span>
+        </div>
+      )}
+
+      {recording && (
+        <div className="pointer-events-none absolute inset-x-3 top-[calc(env(safe-area-inset-top,0px)+5.75rem)] z-10 flex justify-center">
+          <span className="max-w-full rounded-lg bg-glass-strong px-3 py-1 text-center text-[10px] text-muted-foreground backdrop-blur">
+            {activeMime || "Códec predeterminado"} · {chunkInfo || "Esperando primer chunk"}
           </span>
         </div>
       )}
