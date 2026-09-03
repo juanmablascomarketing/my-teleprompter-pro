@@ -586,9 +586,20 @@ function RecordPage() {
                 ))}
               </select>
             </div>
+            <label className="mt-4 flex items-center gap-3 text-sm">
+              <input
+                type="checkbox"
+                checked={lowBitrate}
+                disabled={recording || countdown !== null}
+                onChange={(e) => setLowBitrate(e.target.checked)}
+                className="size-5 accent-primary"
+              />
+              <span>Prueba de control: bitrate bajo (2 Mbps)</span>
+            </label>
             <div className="mt-3 space-y-1 text-xs text-muted-foreground">
               <p>Vídeo: {videoInfo || "—"}</p>
               <p className="truncate">Micrófono: {audioLabel || "—"}</p>
+              {recLog && <p className="truncate text-foreground">Estado: {recLog}</p>}
             </div>
           </div>
         )}
