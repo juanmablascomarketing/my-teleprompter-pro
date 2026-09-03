@@ -74,6 +74,10 @@ function pickMime() {
   return candidates.find((t) => MediaRecorder.isTypeSupported(t));
 }
 
+function fmtMB(bytes: number) {
+  return `${(bytes / 1_048_576).toFixed(1)} MB`;
+}
+
 function RecordPage() {
   const { id } = Route.useParams();
   const router = useRouter();
