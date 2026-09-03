@@ -314,15 +314,16 @@ function RecordPage() {
     setCountdown(null);
 
     const mimeType = pickMime();
-    setDownloadExt(mimeType?.includes("mp4") ? "mp4" : "webm");
+    const isWebm = !mimeType?.includes("mp4");
+    setDownloadExt(isWebm ? "webm" : "mp4");
     chunksRef.current = [];
+    stoppingRef.current = false;
     const vset = stream.getVideoTracks()[0]?.getSettings();
     const pixels = (vset?.width ?? 1920) * (vset?.height ?? 1080);
     const fps = vset?.frameRate ?? 30;
-    const videoBitsPerSecond = Math.min(
-      40_000_000,
-      Math.max(8_000_000, Math.round(pixels * fps * 0.1)),
-    );
+    const videoBitsPerSecond = lowBitrate
+      ? 2_000_000
+      : Math.min(24_000_000, Math.max(8_000_000, Math.round(pixels * fps * 0.07)));
     const rec = new MediaRecorder(stream, {
       ...(mimeType ? { mimeType } : {}),
       videoBitsPerSecond,
@@ -331,25 +332,61 @@ function RecordPage() {
     rec.ondataavailable = (e) => {
       if (e.data.size > 0) chunksRef.current.push(e.data);
     };
-    rec.onstop = () => {
-      const blob = new Blob(chunksRef.current, { type: mimeType ?? "video/webm" });
+    rec.onerror = (e) => {
+      console.error("[MediaRecorder] error", e);
+      setRecLog(`Error del grabador: ${String((e as unknown as { error?: Error }).error ?? e)}`);
+    };
+    rec.onstop = async () => {
+      const durationMs = Date.now() - startTsRef.current;
+      let blob = new Blob(chunksRef.current, { type: mimeType ?? "video/webm" });
+      chunksRef.current = [];
+      let log = `onstop OK · ${chunkCountLabel(blob)} · ${fmtMB(blob.size)} · ${Math.round(durationMs / 1000)}s`;
+      if (isWebm) {
+        try {
+          const { default: fixWebmDuration } = await import("fix-webm-duration");
+          blob = await fixWebmDuration(blob, durationMs, { logger: false });
+          log += " · duración WebM reparada";
+        } catch (err) {
+          console.error("[WebM] no se pudo reparar la duración", err);
+          log += " · aviso: duración WebM sin reparar";
+        }
+      }
+      console.info("[Grabación]", log);
+      setRecLog(log);
       setDownloadUrl(URL.createObjectURL(blob));
+      setFinalizing(false);
     };
     recorderRef.current = rec;
-    rec.start(1000);
+    startTsRef.current = Date.now();
+    rec.start(2000);
+    setRecLog("Grabando…");
     setElapsed(0);
     setRecording(true);
     setScrolling(true);
     requestWakeLock();
   }
 
+  function chunkCountLabel(blob: Blob) {
+    return blob.type || "video/webm";
+  }
+
   function stopRecording() {
-    recorderRef.current?.stop();
-    recorderRef.current = null;
+    const rec = recorderRef.current;
     setRecording(false);
     setScrolling(false);
     setShowPanel(true);
     releaseWakeLock();
+    if (!rec || stoppingRef.current || rec.state === "inactive") return;
+    stoppingRef.current = true;
+    setFinalizing(true);
+    setRecLog("Cerrando archivo… no cierres la pantalla");
+    try {
+      rec.requestData();
+    } catch {
+      /* ignore */
+    }
+    rec.stop();
+    recorderRef.current = null;
   }
 
   const title = script?.title ?? "";
