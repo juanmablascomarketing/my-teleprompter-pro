@@ -74,6 +74,10 @@ function pickMime() {
   return candidates.find((t) => MediaRecorder.isTypeSupported(t));
 }
 
+function fmtMB(bytes: number) {
+  return `${(bytes / 1_048_576).toFixed(1)} MB`;
+}
+
 function RecordPage() {
   const { id } = Route.useParams();
   const router = useRouter();
@@ -94,11 +98,16 @@ function RecordPage() {
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const [downloadExt, setDownloadExt] = useState("webm");
   const [showPanel, setShowPanel] = useState(true);
+  const [recLog, setRecLog] = useState("");
+  const [lowBitrate, setLowBitrate] = useState(false);
+  const [finalizing, setFinalizing] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+  const stoppingRef = useRef(false);
+  const startTsRef = useRef(0);
   const trackRef = useRef<HTMLDivElement>(null);
   const offsetRef = useRef(0);
   const rafRef = useRef<number | null>(null);
@@ -305,15 +314,16 @@ function RecordPage() {
     setCountdown(null);
 
     const mimeType = pickMime();
-    setDownloadExt(mimeType?.includes("mp4") ? "mp4" : "webm");
+    const isWebm = !mimeType?.includes("mp4");
+    setDownloadExt(isWebm ? "webm" : "mp4");
     chunksRef.current = [];
+    stoppingRef.current = false;
     const vset = stream.getVideoTracks()[0]?.getSettings();
     const pixels = (vset?.width ?? 1920) * (vset?.height ?? 1080);
     const fps = vset?.frameRate ?? 30;
-    const videoBitsPerSecond = Math.min(
-      40_000_000,
-      Math.max(8_000_000, Math.round(pixels * fps * 0.1)),
-    );
+    const videoBitsPerSecond = lowBitrate
+      ? 2_000_000
+      : Math.min(24_000_000, Math.max(8_000_000, Math.round(pixels * fps * 0.07)));
     const rec = new MediaRecorder(stream, {
       ...(mimeType ? { mimeType } : {}),
       videoBitsPerSecond,
@@ -322,25 +332,61 @@ function RecordPage() {
     rec.ondataavailable = (e) => {
       if (e.data.size > 0) chunksRef.current.push(e.data);
     };
-    rec.onstop = () => {
-      const blob = new Blob(chunksRef.current, { type: mimeType ?? "video/webm" });
+    rec.onerror = (e) => {
+      console.error("[MediaRecorder] error", e);
+      setRecLog(`Error del grabador: ${String((e as unknown as { error?: Error }).error ?? e)}`);
+    };
+    rec.onstop = async () => {
+      const durationMs = Date.now() - startTsRef.current;
+      let blob = new Blob(chunksRef.current, { type: mimeType ?? "video/webm" });
+      chunksRef.current = [];
+      let log = `onstop OK · ${chunkCountLabel(blob)} · ${fmtMB(blob.size)} · ${Math.round(durationMs / 1000)}s`;
+      if (isWebm) {
+        try {
+          const { default: fixWebmDuration } = await import("fix-webm-duration");
+          blob = await fixWebmDuration(blob, durationMs, { logger: false });
+          log += " · duración WebM reparada";
+        } catch (err) {
+          console.error("[WebM] no se pudo reparar la duración", err);
+          log += " · aviso: duración WebM sin reparar";
+        }
+      }
+      console.info("[Grabación]", log);
+      setRecLog(log);
       setDownloadUrl(URL.createObjectURL(blob));
+      setFinalizing(false);
     };
     recorderRef.current = rec;
-    rec.start(1000);
+    startTsRef.current = Date.now();
+    rec.start(2000);
+    setRecLog("Grabando…");
     setElapsed(0);
     setRecording(true);
     setScrolling(true);
     requestWakeLock();
   }
 
+  function chunkCountLabel(blob: Blob) {
+    return blob.type || "video/webm";
+  }
+
   function stopRecording() {
-    recorderRef.current?.stop();
-    recorderRef.current = null;
+    const rec = recorderRef.current;
     setRecording(false);
     setScrolling(false);
     setShowPanel(true);
     releaseWakeLock();
+    if (!rec || stoppingRef.current || rec.state === "inactive") return;
+    stoppingRef.current = true;
+    setFinalizing(true);
+    setRecLog("Cerrando archivo… no cierres la pantalla");
+    try {
+      rec.requestData();
+    } catch {
+      /* ignore */
+    }
+    rec.stop();
+    recorderRef.current = null;
   }
 
   const title = script?.title ?? "";
@@ -540,10 +586,27 @@ function RecordPage() {
                 ))}
               </select>
             </div>
+            <label className="mt-4 flex items-center gap-3 text-sm">
+              <input
+                type="checkbox"
+                checked={lowBitrate}
+                disabled={recording || countdown !== null}
+                onChange={(e) => setLowBitrate(e.target.checked)}
+                className="size-5 accent-primary"
+              />
+              <span>Prueba de control: bitrate bajo (2 Mbps)</span>
+            </label>
             <div className="mt-3 space-y-1 text-xs text-muted-foreground">
               <p>Vídeo: {videoInfo || "—"}</p>
               <p className="truncate">Micrófono: {audioLabel || "—"}</p>
+              {recLog && <p className="truncate text-foreground">Estado: {recLog}</p>}
             </div>
+          </div>
+        )}
+
+        {finalizing && (
+          <div className="mb-3 rounded-2xl bg-glass-strong px-4 py-2 text-center text-sm font-semibold backdrop-blur">
+            Cerrando el archivo de vídeo…
           </div>
         )}
 
