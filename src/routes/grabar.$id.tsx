@@ -62,15 +62,27 @@ function fmt(sec: number) {
   return `${m}:${s}`;
 }
 
-function pickMime() {
+const CODEC_CANDIDATES = [
+  "video/webm;codecs=vp8,opus",
+  "video/webm;codecs=vp9,opus",
+  "video/mp4;codecs=avc1,mp4a.40.2",
+  "video/mp4",
+  "video/webm",
+] as const;
+
+function getCodecSupport() {
+  if (typeof MediaRecorder === "undefined") return [];
+  return CODEC_CANDIDATES.map((mimeType) => ({
+    mimeType,
+    supported: MediaRecorder.isTypeSupported(mimeType),
+  }));
+}
+
+function pickMime(diagnosticMode: boolean) {
   if (typeof MediaRecorder === "undefined") return undefined;
-  const candidates = [
-    "video/mp4;codecs=avc1,mp4a.40.2",
-    "video/mp4",
-    "video/webm;codecs=vp9,opus",
-    "video/webm;codecs=vp8,opus",
-    "video/webm",
-  ];
+  const candidates = diagnosticMode
+    ? ["video/webm;codecs=vp8,opus", "video/webm", "video/webm;codecs=vp9,opus"]
+    : CODEC_CANDIDATES;
   return candidates.find((t) => MediaRecorder.isTypeSupported(t));
 }
 
@@ -99,13 +111,17 @@ function RecordPage() {
   const [downloadExt, setDownloadExt] = useState("webm");
   const [showPanel, setShowPanel] = useState(true);
   const [recLog, setRecLog] = useState("");
-  const [lowBitrate, setLowBitrate] = useState(false);
+  const [diagnosticMode, setDiagnosticMode] = useState(false);
+  const [codecSupport, setCodecSupport] = useState<ReturnType<typeof getCodecSupport>>([]);
+  const [activeMime, setActiveMime] = useState("");
+  const [chunkInfo, setChunkInfo] = useState("");
   const [finalizing, setFinalizing] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+  const chunkStatsRef = useRef({ total: 0, empty: 0, small: 0 });
   const stoppingRef = useRef(false);
   const startTsRef = useRef(0);
   const trackRef = useRef<HTMLDivElement>(null);
@@ -126,6 +142,12 @@ function RecordPage() {
     setPrefs(loadPrefs());
   }, [id, router]);
 
+  useEffect(() => {
+    const support = getCodecSupport();
+    setCodecSupport(support);
+    console.info("[MediaRecorder] soporte de códecs", support);
+  }, []);
+
   const refreshDevices = useCallback(async () => {
     try {
       const list = await navigator.mediaDevices.enumerateDevices();
@@ -136,12 +158,16 @@ function RecordPage() {
   }, []);
 
   const startCamera = useCallback(
-    async (facing: "user" | "environment", audioDeviceId: string) => {
+    async (
+      facing: "user" | "environment",
+      audioDeviceId: string,
+      useDiagnosticMode: boolean,
+    ) => {
       const videoConstraints: MediaStreamConstraints = {
         video: {
           facingMode: facing,
-          width: { ideal: 3840 },
-          height: { ideal: 2160 },
+          width: { ideal: useDiagnosticMode ? 720 : 1080 },
+          height: { ideal: useDiagnosticMode ? 1280 : 1920 },
           frameRate: { ideal: 30 },
         },
       };
@@ -191,7 +217,12 @@ function RecordPage() {
 
       const vs = stream.getVideoTracks()[0]?.getSettings();
       if (vs) {
-        setVideoInfo(`${vs.width ?? "?"}×${vs.height ?? "?"} @ ${Math.round(vs.frameRate ?? 0)}fps`);
+        const orientation =
+          vs.width && vs.height ? (vs.height > vs.width ? "vertical" : "horizontal") : "orientación ?";
+        setVideoInfo(
+          `${vs.width ?? "?"}×${vs.height ?? "?"} · ${orientation} @ ${Math.round(vs.frameRate ?? 0)}fps`,
+        );
+        console.info("[Cámara] ajustes reales", vs);
       }
       const at = stream.getAudioTracks()[0];
       if (at) setAudioLabel(at.label || "Micrófono predeterminado");
@@ -212,7 +243,7 @@ function RecordPage() {
 
   useEffect(() => {
     const p = loadPrefs();
-    startCamera(p.facingMode, p.audioDeviceId);
+    startCamera(p.facingMode, p.audioDeviceId, false);
     return () => {
       streamRef.current?.getTracks().forEach((t) => t.stop());
     };
@@ -313,16 +344,19 @@ function RecordPage() {
     }
     setCountdown(null);
 
-    const mimeType = pickMime();
+    const mimeType = pickMime(diagnosticMode);
     const isWebm = !mimeType?.includes("mp4");
+    setActiveMime(mimeType ?? "Predeterminado del navegador");
     setDownloadExt(isWebm ? "webm" : "mp4");
     chunksRef.current = [];
+    chunkStatsRef.current = { total: 0, empty: 0, small: 0 };
+    setChunkInfo("0 chunks · 0 vacíos · 0 pequeños");
     stoppingRef.current = false;
     const vset = stream.getVideoTracks()[0]?.getSettings();
     const pixels = (vset?.width ?? 1920) * (vset?.height ?? 1080);
     const fps = vset?.frameRate ?? 30;
-    const videoBitsPerSecond = lowBitrate
-      ? 2_000_000
+    const videoBitsPerSecond = diagnosticMode
+      ? 4_000_000
       : Math.min(24_000_000, Math.max(8_000_000, Math.round(pixels * fps * 0.07)));
     const rec = new MediaRecorder(stream, {
       ...(mimeType ? { mimeType } : {}),
@@ -330,7 +364,25 @@ function RecordPage() {
       audioBitsPerSecond: 192_000,
     });
     rec.ondataavailable = (e) => {
-      if (e.data.size > 0) chunksRef.current.push(e.data);
+      const stats = chunkStatsRef.current;
+      stats.total += 1;
+      if (e.data.size === 0) {
+        stats.empty += 1;
+        console.error("[MediaRecorder] chunk vacío", { index: stats.total, timecode: e.timecode });
+      } else {
+        chunksRef.current.push(e.data);
+        if (e.data.size < 10_240) {
+          stats.small += 1;
+          console.warn("[MediaRecorder] chunk anormalmente pequeño", {
+            index: stats.total,
+            bytes: e.data.size,
+            timecode: e.timecode,
+          });
+        }
+      }
+      setChunkInfo(
+        `${stats.total} chunks · ${stats.empty} vacíos · ${stats.small} pequeños · último ${fmtMB(e.data.size)}`,
+      );
     };
     rec.onerror = (e) => {
       console.error("[MediaRecorder] error", e);
@@ -340,7 +392,8 @@ function RecordPage() {
       const durationMs = Date.now() - startTsRef.current;
       let blob = new Blob(chunksRef.current, { type: mimeType ?? "video/webm" });
       chunksRef.current = [];
-      let log = `onstop OK · ${chunkCountLabel(blob)} · ${fmtMB(blob.size)} · ${Math.round(durationMs / 1000)}s`;
+      const stats = chunkStatsRef.current;
+      let log = `onstop OK · ${chunkCountLabel(blob)} · ${fmtMB(blob.size)} · ${Math.round(durationMs / 1000)}s · ${stats.total} chunks (${stats.empty} vacíos, ${stats.small} pequeños)`;
       if (isWebm) {
         try {
           const { default: fixWebmDuration } = await import("fix-webm-duration");
@@ -469,7 +522,7 @@ function RecordPage() {
             onClick={() => {
               const next = prefs.facingMode === "user" ? "environment" : "user";
               updatePrefs({ facingMode: next });
-              startCamera(next, prefs.audioDeviceId);
+              startCamera(next, prefs.audioDeviceId, diagnosticMode);
             }}
           >
             <SwitchCamera className="size-5" />
@@ -492,7 +545,7 @@ function RecordPage() {
           <div className="max-w-sm rounded-3xl border border-border bg-card p-6 text-center">
             <h2 className="text-lg font-bold">Error real de cámara</h2>
             <p className="mt-2 text-sm text-muted-foreground">
-              Petición ejecutada: <code>getUserMedia({"{ video: true }"})</code>
+              Petición ejecutada con resolución vertical ideal: {diagnosticMode ? "720×1280" : "1080×1920"}.
             </p>
             <pre className="mt-3 whitespace-pre-wrap break-words rounded-lg bg-muted p-3 text-left text-xs text-foreground">
               {permMsg}
@@ -503,7 +556,7 @@ function RecordPage() {
             </p>
             <Button
               className="mt-5 h-12 w-full rounded-2xl font-bold"
-              onClick={() => startCamera(prefs.facingMode, prefs.audioDeviceId)}
+              onClick={() => startCamera(prefs.facingMode, prefs.audioDeviceId, diagnosticMode)}
             >
               Reintentar
             </Button>
@@ -574,7 +627,7 @@ function RecordPage() {
                 onChange={(e) => {
                   const value = e.target.value;
                   updatePrefs({ audioDeviceId: value });
-                  startCamera(prefs.facingMode, value);
+                  startCamera(prefs.facingMode, value, diagnosticMode);
                 }}
                 className="min-w-0 flex-1 rounded-xl border border-border bg-card px-3 py-2 text-sm text-foreground disabled:opacity-40"
               >
@@ -589,17 +642,27 @@ function RecordPage() {
             <label className="mt-4 flex items-center gap-3 text-sm">
               <input
                 type="checkbox"
-                checked={lowBitrate}
+                checked={diagnosticMode}
                 disabled={recording || countdown !== null}
-                onChange={(e) => setLowBitrate(e.target.checked)}
+                onChange={(e) => {
+                  const enabled = e.target.checked;
+                  setDiagnosticMode(enabled);
+                  startCamera(prefs.facingMode, prefs.audioDeviceId, enabled);
+                }}
                 className="size-5 accent-primary"
               />
-              <span>Prueba de control: bitrate bajo (2 Mbps)</span>
+              <span>Prueba estable: vertical 720×1280 · VP8 · 4 Mbps</span>
             </label>
             <div className="mt-3 space-y-1 text-xs text-muted-foreground">
+              <p>Perfil: {diagnosticMode ? "Prueba VP8 720p / 4 Mbps" : "Vertical 1080×1920"}</p>
               <p>Vídeo: {videoInfo || "—"}</p>
               <p className="truncate">Micrófono: {audioLabel || "—"}</p>
-              {recLog && <p className="truncate text-foreground">Estado: {recLog}</p>}
+              <p className="break-words">Códec activo: {activeMime || "Se decidirá al grabar"}</p>
+              <p className="break-words">
+                Soporte: {codecSupport.map((codec) => `${codec.mimeType.replace("video/", "")} ${codec.supported ? "✓" : "✕"}`).join(" · ") || "—"}
+              </p>
+              {chunkInfo && <p className="break-words">Chunks: {chunkInfo}</p>}
+              {recLog && <p className="break-words text-foreground">Estado: {recLog}</p>}
             </div>
           </div>
         )}
