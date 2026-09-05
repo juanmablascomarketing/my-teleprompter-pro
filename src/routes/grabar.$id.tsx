@@ -189,11 +189,7 @@ function RecordPage() {
   }, []);
 
   const startCamera = useCallback(
-    async (
-      facing: "user" | "environment",
-      audioDeviceId: string,
-      useDiagnosticMode: boolean,
-    ) => {
+    async (facing: "user" | "environment", audioDeviceId: string, useDiagnosticMode: boolean) => {
       const videoConstraints: MediaStreamConstraints = {
         video: {
           facingMode: facing,
@@ -269,7 +265,11 @@ function RecordPage() {
       const vs = videoTrack?.getSettings() as ZoomSettings | undefined;
       if (vs) {
         const orientation =
-          vs.width && vs.height ? (vs.height > vs.width ? "vertical" : "horizontal") : "orientación ?";
+          vs.width && vs.height
+            ? vs.height > vs.width
+              ? "vertical"
+              : "horizontal"
+            : "orientación ?";
         setVideoInfo(
           `${vs.width ?? "?"}×${vs.height ?? "?"} · ${orientation} @ ${Math.round(vs.frameRate ?? 0)}fps`,
         );
@@ -312,7 +312,6 @@ function RecordPage() {
     refreshDevices();
     return () => navigator.mediaDevices?.removeEventListener("devicechange", onChange);
   }, [refreshDevices]);
-
 
   // Auto-scroll loop
   useEffect(() => {
@@ -628,9 +627,7 @@ function RecordPage() {
       {/* Countdown */}
       {countdown !== null && (
         <div className="absolute inset-0 grid place-items-center bg-black/50">
-          <span className="text-[8rem] font-extrabold text-primary tabular-nums">
-            {countdown}
-          </span>
+          <span className="text-[8rem] font-extrabold text-primary tabular-nums">{countdown}</span>
         </div>
       )}
 
@@ -640,7 +637,8 @@ function RecordPage() {
           <div className="max-w-sm rounded-3xl border border-border bg-card p-6 text-center">
             <h2 className="text-lg font-bold">Error real de cámara</h2>
             <p className="mt-2 text-sm text-muted-foreground">
-              Petición ejecutada con resolución vertical ideal: {diagnosticMode ? "720×1280" : "1080×1920"}.
+              Petición ejecutada con resolución vertical ideal:{" "}
+              {diagnosticMode ? "720×1280" : "1080×1920"}.
             </p>
             <pre className="mt-3 whitespace-pre-wrap break-words rounded-lg bg-muted p-3 text-left text-xs text-foreground">
               {permMsg}
@@ -674,7 +672,9 @@ function RecordPage() {
       {perm === "ready" && (videoInfo || zoomInfo || audioLabel) && (
         <div className="pointer-events-none absolute inset-x-3 top-[calc(env(safe-area-inset-top,0px)+3.75rem)] z-10 flex justify-center">
           <div className="max-w-full rounded-lg bg-glass-strong px-3 py-1 text-center text-[10px] text-muted-foreground backdrop-blur">
-            <p>{videoInfo} · {audioLabel}</p>
+            <p>
+              {videoInfo} · {audioLabel}
+            </p>
             <p>{zoomInfo}</p>
           </div>
         </div>
@@ -692,8 +692,12 @@ function RecordPage() {
                 <p className="text-center">Primer fragmento esperado cerca de 2,00 s</p>
               ) : (
                 chunkEvents.slice(-8).map((chunk) => (
-                  <p key={chunk.index} className={chunk.bytes === 0 ? "font-bold text-destructive" : ""}>
-                    Chunk {chunk.index}: seg {chunk.elapsedSeconds.toFixed(2)} · {fmtChunkSize(chunk.bytes)} · intervalo {chunk.intervalSeconds.toFixed(2)} s
+                  <p
+                    key={chunk.index}
+                    className={chunk.bytes === 0 ? "font-bold text-destructive" : ""}
+                  >
+                    Chunk {chunk.index}: seg {chunk.elapsedSeconds.toFixed(2)} ·{" "}
+                    {fmtChunkSize(chunk.bytes)} · intervalo {chunk.intervalSeconds.toFixed(2)} s
                   </p>
                 ))
               )}
@@ -778,7 +782,13 @@ function RecordPage() {
               <p className="truncate">Micrófono: {audioLabel || "—"}</p>
               <p className="break-words">Códec activo: {activeMime || "Se decidirá al grabar"}</p>
               <p className="break-words">
-                Soporte: {codecSupport.map((codec) => `${codec.mimeType.replace("video/", "")} ${codec.supported ? "✓" : "✕"}`).join(" · ") || "—"}
+                Soporte:{" "}
+                {codecSupport
+                  .map(
+                    (codec) =>
+                      `${codec.mimeType.replace("video/", "")} ${codec.supported ? "✓" : "✕"}`,
+                  )
+                  .join(" · ") || "—"}
               </p>
               {chunkInfo && <p className="break-words">Chunks: {chunkInfo}</p>}
               {recLog && <p className="break-words text-foreground">Estado: {recLog}</p>}
