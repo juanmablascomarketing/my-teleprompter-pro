@@ -57,6 +57,15 @@ type ZoomConstraintSet = MediaTrackConstraintSet & {
   zoom?: number;
 };
 
+type ChunkEvent = {
+  index: number;
+  elapsedSeconds: number;
+  intervalSeconds: number;
+  bytes: number;
+};
+
+const RECORDER_TIMESLICE_MS = 2_000;
+
 function mediaErrorDetails(error: unknown) {
   if (error instanceof DOMException || error instanceof Error) {
     return `${error.name}: ${error.message || "Sin mensaje adicional"}`;
@@ -102,6 +111,11 @@ function fmtMB(bytes: number) {
   return `${(bytes / 1_048_576).toFixed(1)} MB`;
 }
 
+function fmtChunkSize(bytes: number) {
+  if (bytes < 1_024) return `${bytes} B`;
+  return `${(bytes / 1_024).toFixed(1)} KB`;
+}
+
 function RecordPage() {
   const { id } = Route.useParams();
   const router = useRouter();
@@ -128,6 +142,7 @@ function RecordPage() {
   const [codecSupport, setCodecSupport] = useState<ReturnType<typeof getCodecSupport>>([]);
   const [activeMime, setActiveMime] = useState("");
   const [chunkInfo, setChunkInfo] = useState("");
+  const [chunkEvents, setChunkEvents] = useState<ChunkEvent[]>([]);
   const [finalizing, setFinalizing] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -135,8 +150,11 @@ function RecordPage() {
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const chunkStatsRef = useRef({ total: 0, empty: 0, small: 0 });
+  const startingRef = useRef(false);
   const stoppingRef = useRef(false);
   const startTsRef = useRef(0);
+  const startPerfRef = useRef(0);
+  const lastChunkPerfRef = useRef(0);
   const trackRef = useRef<HTMLDivElement>(null);
   const offsetRef = useRef(0);
   const rafRef = useRef<number | null>(null);
@@ -323,10 +341,15 @@ function RecordPage() {
     };
   }, [scrolling]);
 
-  // Recording timer
+  // Recording timer. This only refreshes the visible clock; elapsed time is
+  // derived from a monotonic timestamp so delayed ticks cannot accumulate.
   useEffect(() => {
     if (!recording) return;
-    const t = window.setInterval(() => setElapsed((e) => e + 1), 1000);
+    const updateElapsed = () => {
+      setElapsed(Math.floor((performance.now() - startPerfRef.current) / 1000));
+    };
+    updateElapsed();
+    const t = window.setInterval(updateElapsed, 250);
     return () => window.clearInterval(t);
   }, [recording]);
 
@@ -371,7 +394,8 @@ function RecordPage() {
 
   async function beginRecording() {
     const stream = streamRef.current;
-    if (!stream) return;
+    if (!stream || startingRef.current || recorderRef.current) return;
+    startingRef.current = true;
     if (downloadUrl) URL.revokeObjectURL(downloadUrl);
     setDownloadUrl(null);
     resetScroll();
@@ -383,12 +407,19 @@ function RecordPage() {
     }
     setCountdown(null);
 
+    if (!stream.active) {
+      startingRef.current = false;
+      setRecLog("La cámara dejó de estar activa durante la cuenta atrás.");
+      return;
+    }
+
     const mimeType = pickMime(diagnosticMode);
     const isWebm = !mimeType?.includes("mp4");
     setActiveMime(mimeType ?? "Predeterminado del navegador");
     setDownloadExt(isWebm ? "webm" : "mp4");
     chunksRef.current = [];
     chunkStatsRef.current = { total: 0, empty: 0, small: 0 };
+    setChunkEvents([]);
     setChunkInfo("0 chunks · 0 vacíos · 0 pequeños");
     stoppingRef.current = false;
     const vset = stream.getVideoTracks()[0]?.getSettings();
@@ -403,11 +434,19 @@ function RecordPage() {
       audioBitsPerSecond: 192_000,
     });
     rec.ondataavailable = (e) => {
+      const now = performance.now();
       const stats = chunkStatsRef.current;
       stats.total += 1;
+      const chunkEvent: ChunkEvent = {
+        index: stats.total,
+        elapsedSeconds: (now - startPerfRef.current) / 1000,
+        intervalSeconds: (now - lastChunkPerfRef.current) / 1000,
+        bytes: e.data.size,
+      };
+      lastChunkPerfRef.current = now;
       if (e.data.size === 0) {
         stats.empty += 1;
-        console.error("[MediaRecorder] chunk vacío", { index: stats.total, timecode: e.timecode });
+        console.error("[MediaRecorder] chunk vacío", { ...chunkEvent, timecode: e.timecode });
       } else {
         chunksRef.current.push(e.data);
         if (!stoppingRef.current && e.data.size < 10_240) {
@@ -416,9 +455,17 @@ function RecordPage() {
             index: stats.total,
             bytes: e.data.size,
             timecode: e.timecode,
+            elapsedSeconds: chunkEvent.elapsedSeconds,
+            intervalSeconds: chunkEvent.intervalSeconds,
           });
         }
       }
+      console.info("[MediaRecorder] ondataavailable", {
+        ...chunkEvent,
+        timecode: e.timecode,
+        recorderState: rec.state,
+      });
+      setChunkEvents((events) => [...events, chunkEvent]);
       setChunkInfo(
         `${stats.total} chunks · ${stats.empty} vacíos · ${stats.small} pequeños · último ${fmtMB(e.data.size)}`,
       );
@@ -450,8 +497,17 @@ function RecordPage() {
     };
     recorderRef.current = rec;
     startTsRef.current = Date.now();
-    rec.start(2000);
-    setRecLog("Grabando…");
+    startPerfRef.current = performance.now();
+    lastChunkPerfRef.current = startPerfRef.current;
+    rec.start(RECORDER_TIMESLICE_MS);
+    startingRef.current = false;
+    console.info("[MediaRecorder] start", {
+      timesliceMs: RECORDER_TIMESLICE_MS,
+      mimeType: rec.mimeType,
+      videoBitsPerSecond: rec.videoBitsPerSecond,
+      audioBitsPerSecond: rec.audioBitsPerSecond,
+    });
+    setRecLog(`Grabando · start(${RECORDER_TIMESLICE_MS} ms)`);
     setElapsed(0);
     setRecording(true);
     setScrolling(true);
@@ -626,9 +682,23 @@ function RecordPage() {
 
       {recording && (
         <div className="pointer-events-none absolute inset-x-3 top-[calc(env(safe-area-inset-top,0px)+5.75rem)] z-10 flex justify-center">
-          <span className="max-w-full rounded-lg bg-glass-strong px-3 py-1 text-center text-[10px] text-muted-foreground backdrop-blur">
-            {activeMime || "Códec predeterminado"} · {chunkInfo || "Esperando primer chunk"}
-          </span>
+          <div className="max-h-[30svh] w-full max-w-md overflow-hidden rounded-lg bg-glass-strong px-3 py-2 text-[10px] text-muted-foreground backdrop-blur">
+            <p className="text-center font-semibold text-foreground">
+              {activeMime || "Códec predeterminado"} · start({RECORDER_TIMESLICE_MS} ms)
+            </p>
+            <p className="mt-0.5 text-center">{chunkInfo || "Esperando primer chunk"}</p>
+            <div className="mt-1 space-y-0.5 font-mono tabular-nums">
+              {chunkEvents.length === 0 ? (
+                <p className="text-center">Primer fragmento esperado cerca de 2,00 s</p>
+              ) : (
+                chunkEvents.slice(-8).map((chunk) => (
+                  <p key={chunk.index} className={chunk.bytes === 0 ? "font-bold text-destructive" : ""}>
+                    Chunk {chunk.index}: seg {chunk.elapsedSeconds.toFixed(2)} · {fmtChunkSize(chunk.bytes)} · intervalo {chunk.intervalSeconds.toFixed(2)} s
+                  </p>
+                ))
+              )}
+            </div>
+          </div>
         </div>
       )}
 
