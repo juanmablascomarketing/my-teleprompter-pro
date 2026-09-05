@@ -45,6 +45,18 @@ export const Route = createFileRoute("/grabar/$id")({
 
 type PermState = "idle" | "ready" | "denied" | "error";
 
+type ZoomCapabilities = MediaTrackCapabilities & {
+  zoom?: { min?: number; max?: number; step?: number };
+};
+
+type ZoomSettings = MediaTrackSettings & {
+  zoom?: number;
+};
+
+type ZoomConstraintSet = MediaTrackConstraintSet & {
+  zoom?: number;
+};
+
 function mediaErrorDetails(error: unknown) {
   if (error instanceof DOMException || error instanceof Error) {
     return `${error.name}: ${error.message || "Sin mensaje adicional"}`;
@@ -100,6 +112,7 @@ function RecordPage() {
   const [permMsg, setPermMsg] = useState("");
   const [audioError, setAudioError] = useState("");
   const [videoInfo, setVideoInfo] = useState("");
+  const [zoomInfo, setZoomInfo] = useState("");
   const [audioLabel, setAudioLabel] = useState("");
   const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
 
@@ -166,6 +179,7 @@ function RecordPage() {
       const videoConstraints: MediaStreamConstraints = {
         video: {
           facingMode: facing,
+          aspectRatio: { ideal: 9 / 16 },
           width: { ideal: useDiagnosticMode ? 720 : 1080 },
           height: { ideal: useDiagnosticMode ? 1280 : 1920 },
           frameRate: { ideal: 30 },
@@ -186,6 +200,7 @@ function RecordPage() {
       setPermMsg("");
       setAudioError("");
       setVideoInfo("");
+      setZoomInfo("");
       setAudioLabel("");
 
       let videoStream: MediaStream;
@@ -215,14 +230,38 @@ function RecordPage() {
       ]);
       streamRef.current = stream;
 
-      const vs = stream.getVideoTracks()[0]?.getSettings();
+      const videoTrack = stream.getVideoTracks()[0];
+      let capabilities: ZoomCapabilities | null = null;
+      if (videoTrack) {
+        try {
+          capabilities = videoTrack.getCapabilities() as ZoomCapabilities;
+          const zoom = capabilities.zoom;
+          if (zoom) {
+            const neutralZoom = Math.min(zoom.max ?? 1, Math.max(zoom.min ?? 1, 1));
+            await videoTrack.applyConstraints({
+              advanced: [{ zoom: neutralZoom } as ZoomConstraintSet],
+            });
+            console.info("[Cámara] zoom neutro aplicado", { neutralZoom, zoom });
+          }
+        } catch (err) {
+          console.warn("[Cámara] no se pudo aplicar zoom neutro", err);
+        }
+      }
+
+      const vs = videoTrack?.getSettings() as ZoomSettings | undefined;
       if (vs) {
         const orientation =
           vs.width && vs.height ? (vs.height > vs.width ? "vertical" : "horizontal") : "orientación ?";
         setVideoInfo(
           `${vs.width ?? "?"}×${vs.height ?? "?"} · ${orientation} @ ${Math.round(vs.frameRate ?? 0)}fps`,
         );
-        console.info("[Cámara] ajustes reales", vs);
+        const zoomCapability = capabilities?.zoom;
+        setZoomInfo(
+          zoomCapability
+            ? `Zoom disponible ${zoomCapability.min ?? "?"}–${zoomCapability.max ?? "?"} (paso ${zoomCapability.step ?? "?"}) · aplicado ${vs.zoom ?? "?"}`
+            : `Zoom no expuesto por el dispositivo · aplicado ${vs.zoom ?? "no informado"}`,
+        );
+        console.info("[Cámara] capacidades y ajustes reales", { capabilities, settings: vs });
       }
       const at = stream.getAudioTracks()[0];
       if (at) setAudioLabel(at.label || "Micrófono predeterminado");
@@ -576,11 +615,12 @@ function RecordPage() {
         </div>
       )}
 
-      {perm === "ready" && (videoInfo || audioLabel) && (
+      {perm === "ready" && (videoInfo || zoomInfo || audioLabel) && (
         <div className="pointer-events-none absolute inset-x-3 top-[calc(env(safe-area-inset-top,0px)+3.75rem)] z-10 flex justify-center">
-          <span className="max-w-full truncate rounded-full bg-glass-strong px-3 py-1 text-[11px] text-muted-foreground backdrop-blur">
-            {videoInfo} · {audioLabel}
-          </span>
+          <div className="max-w-full rounded-lg bg-glass-strong px-3 py-1 text-center text-[10px] text-muted-foreground backdrop-blur">
+            <p>{videoInfo} · {audioLabel}</p>
+            <p>{zoomInfo}</p>
+          </div>
         </div>
       )}
 
@@ -664,6 +704,7 @@ function RecordPage() {
             <div className="mt-3 space-y-1 text-xs text-muted-foreground">
               <p>Perfil: {diagnosticMode ? "Prueba VP8 720p / 4 Mbps" : "Vertical 1080×1920"}</p>
               <p>Vídeo: {videoInfo || "—"}</p>
+              <p>Zoom: {zoomInfo || "—"}</p>
               <p className="truncate">Micrófono: {audioLabel || "—"}</p>
               <p className="break-words">Códec activo: {activeMime || "Se decidirá al grabar"}</p>
               <p className="break-words">
