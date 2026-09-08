@@ -34,6 +34,8 @@ export const Route = createFileRoute("/grabar/$id")({
           "Vista de cámara a pantalla completa con tu guion en scroll automático, velocidad ajustable, modo espejo y grabación descargable.",
       },
       { property: "og:title", content: "Grabar con teleprompter" },
+      { property: "og:type", content: "website" },
+      { name: "twitter:card", content: "summary" },
       {
         property: "og:description",
         content: "Cámara en directo con el guion superpuesto en scroll automático.",
@@ -56,16 +58,6 @@ type ZoomSettings = MediaTrackSettings & {
 type ZoomConstraintSet = MediaTrackConstraintSet & {
   zoom?: number;
 };
-
-type ChunkEvent = {
-  index: number;
-  elapsedSeconds: number;
-  intervalSeconds: number;
-  bytes: number;
-};
-
-const DATA_REQUEST_INTERVAL_MS = 2_000;
-const DATA_REQUEST_MIN_GAP_MS = 500;
 
 function mediaErrorDetails(error: unknown) {
   if (error instanceof DOMException || error instanceof Error) {
@@ -112,11 +104,6 @@ function fmtMB(bytes: number) {
   return `${(bytes / 1_048_576).toFixed(1)} MB`;
 }
 
-function fmtChunkSize(bytes: number) {
-  if (bytes < 1_024) return `${bytes} B`;
-  return `${(bytes / 1_024).toFixed(1)} KB`;
-}
-
 function RecordPage() {
   const { id } = Route.useParams();
   const router = useRouter();
@@ -142,23 +129,16 @@ function RecordPage() {
   const [diagnosticMode, setDiagnosticMode] = useState(false);
   const [codecSupport, setCodecSupport] = useState<ReturnType<typeof getCodecSupport>>([]);
   const [activeMime, setActiveMime] = useState("");
-  const [chunkInfo, setChunkInfo] = useState("");
-  const [chunkEvents, setChunkEvents] = useState<ChunkEvent[]>([]);
   const [finalizing, setFinalizing] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
-  const chunkStatsRef = useRef({ total: 0, empty: 0, small: 0 });
+  const finalChunkRef = useRef<Blob | null>(null);
   const startingRef = useRef(false);
   const stoppingRef = useRef(false);
   const startTsRef = useRef(0);
   const startPerfRef = useRef(0);
-  const lastChunkPerfRef = useRef(0);
-  const dataRequestIntervalRef = useRef<number | null>(null);
-  const dataRequestGuardRef = useRef(false);
-  const lastDataRequestPerfRef = useRef(Number.NEGATIVE_INFINITY);
   const trackRef = useRef<HTMLDivElement>(null);
   const offsetRef = useRef(0);
   const rafRef = useRef<number | null>(null);
@@ -194,12 +174,27 @@ function RecordPage() {
 
   const startCamera = useCallback(
     async (facing: "user" | "environment", audioDeviceId: string, useDiagnosticMode: boolean) => {
-      const videoConstraints: MediaStreamConstraints = {
+      const portraitWidth = useDiagnosticMode ? 720 : 1080;
+      const portraitHeight = useDiagnosticMode ? 1280 : 1920;
+      const orientationType = window.screen.orientation?.type ?? "desconocida";
+      const screenIsLandscape = orientationType.startsWith("landscape");
+      const fallbackWidth = screenIsLandscape ? portraitHeight : portraitWidth;
+      const fallbackHeight = screenIsLandscape ? portraitWidth : portraitHeight;
+      const exactVideoConstraints: MediaStreamConstraints = {
+        video: {
+          facingMode: facing,
+          aspectRatio: { exact: 9 / 16 },
+          width: { ideal: portraitWidth },
+          height: { ideal: portraitHeight },
+          frameRate: { ideal: 30 },
+        },
+      };
+      const fallbackVideoConstraints: MediaStreamConstraints = {
         video: {
           facingMode: facing,
           aspectRatio: { ideal: 9 / 16 },
-          width: { ideal: useDiagnosticMode ? 720 : 1080 },
-          height: { ideal: useDiagnosticMode ? 1280 : 1920 },
+          width: { ideal: fallbackWidth },
+          height: { ideal: fallbackHeight },
           frameRate: { ideal: 30 },
         },
       };
@@ -223,14 +218,48 @@ function RecordPage() {
 
       let videoStream: MediaStream;
       try {
-        videoStream = await navigator.mediaDevices.getUserMedia(videoConstraints);
+        videoStream = await navigator.mediaDevices.getUserMedia(exactVideoConstraints);
       } catch (err) {
-        const details = mediaErrorDetails(err);
-        console.error("[Cámara] getUserMedia falló", { constraints: videoConstraints, err });
         const name = err instanceof DOMException || err instanceof Error ? err.name : "";
-        setPerm(name === "NotAllowedError" || name === "SecurityError" ? "denied" : "error");
-        setPermMsg(details);
-        return;
+        if (name === "OverconstrainedError") {
+          console.warn("[Cámara] 9:16 exacto no disponible; usando fallback", {
+            exactVideoConstraints,
+            fallbackVideoConstraints,
+            orientationType,
+            err,
+          });
+          try {
+            videoStream = await navigator.mediaDevices.getUserMedia(fallbackVideoConstraints);
+          } catch (fallbackError) {
+            const details = mediaErrorDetails(fallbackError);
+            console.error("[Cámara] fallback de getUserMedia falló", {
+              constraints: fallbackVideoConstraints,
+              orientationType,
+              err: fallbackError,
+            });
+            const fallbackName =
+              fallbackError instanceof DOMException || fallbackError instanceof Error
+                ? fallbackError.name
+                : "";
+            setPerm(
+              fallbackName === "NotAllowedError" || fallbackName === "SecurityError"
+                ? "denied"
+                : "error",
+            );
+            setPermMsg(`9:16 exacto no compatible. Fallback: ${details}`);
+            return;
+          }
+        } else {
+          const details = mediaErrorDetails(err);
+          console.error("[Cámara] getUserMedia falló", {
+            constraints: exactVideoConstraints,
+            orientationType,
+            err,
+          });
+          setPerm(name === "NotAllowedError" || name === "SecurityError" ? "denied" : "error");
+          setPermMsg(details);
+          return;
+        }
       }
 
       let audioStream: MediaStream | null = null;
@@ -283,7 +312,12 @@ function RecordPage() {
             ? `Zoom disponible ${zoomCapability.min ?? "?"}–${zoomCapability.max ?? "?"} (paso ${zoomCapability.step ?? "?"}) · aplicado ${vs.zoom ?? "?"}`
             : `Zoom no expuesto por el dispositivo · aplicado ${vs.zoom ?? "no informado"}`,
         );
-        console.info("[Cámara] capacidades y ajustes reales", { capabilities, settings: vs });
+        console.info("[Cámara] capacidades y ajustes reales", {
+          capabilities,
+          settings: vs,
+          screenOrientation: orientationType,
+          requestedExactAspectRatio: 9 / 16,
+        });
       }
       const at = stream.getAudioTracks()[0];
       if (at) setAudioLabel(at.label || "Micrófono predeterminado");
@@ -385,16 +419,6 @@ function RecordPage() {
 
   useEffect(() => () => void releaseWakeLock(), [releaseWakeLock]);
 
-  useEffect(
-    () => () => {
-      if (dataRequestIntervalRef.current !== null) {
-        window.clearInterval(dataRequestIntervalRef.current);
-        dataRequestIntervalRef.current = null;
-      }
-    },
-    [],
-  );
-
   function resetScroll() {
     offsetRef.current = 0;
     if (trackRef.current) trackRef.current.style.transform = "translate3d(0,0,0)";
@@ -403,42 +427,6 @@ function RecordPage() {
   function updatePrefs(patch: Partial<Prefs>) {
     setPrefs((p) => ({ ...p, ...patch }));
     savePrefs(patch);
-  }
-
-  function requestRecorderData(rec: MediaRecorder, reason: "intervalo" | "final") {
-    const now = performance.now();
-    const sinceLastRequest = now - lastDataRequestPerfRef.current;
-    if (
-      rec.state !== "recording" ||
-      dataRequestGuardRef.current ||
-      sinceLastRequest < DATA_REQUEST_MIN_GAP_MS
-    ) {
-      console.warn("[MediaRecorder] requestData omitido por protección", {
-        reason,
-        recorderState: rec.state,
-        guardActive: dataRequestGuardRef.current,
-        sinceLastRequestMs: Math.round(sinceLastRequest),
-      });
-      return false;
-    }
-
-    dataRequestGuardRef.current = true;
-    lastDataRequestPerfRef.current = now;
-    try {
-      rec.requestData();
-      console.info("[MediaRecorder] requestData manual", {
-        reason,
-        elapsedSeconds: (now - startPerfRef.current) / 1000,
-      });
-      return true;
-    } catch (err) {
-      console.error("[MediaRecorder] requestData falló", { reason, err });
-      return false;
-    } finally {
-      window.setTimeout(() => {
-        dataRequestGuardRef.current = false;
-      }, 100);
-    }
   }
 
   async function beginRecording() {
@@ -466,10 +454,7 @@ function RecordPage() {
     const isWebm = !mimeType?.includes("mp4");
     setActiveMime(mimeType ?? "Predeterminado del navegador");
     setDownloadExt(isWebm ? "webm" : "mp4");
-    chunksRef.current = [];
-    chunkStatsRef.current = { total: 0, empty: 0, small: 0 };
-    setChunkEvents([]);
-    setChunkInfo("0 chunks · 0 vacíos · 0 pequeños");
+    finalChunkRef.current = null;
     stoppingRef.current = false;
     const vset = stream.getVideoTracks()[0]?.getSettings();
     const pixels = (vset?.width ?? 1920) * (vset?.height ?? 1080);
@@ -483,57 +468,38 @@ function RecordPage() {
       audioBitsPerSecond: 192_000,
     });
     rec.ondataavailable = (e) => {
-      const now = performance.now();
-      const stats = chunkStatsRef.current;
-      stats.total += 1;
-      const chunkEvent: ChunkEvent = {
-        index: stats.total,
-        elapsedSeconds: (now - startPerfRef.current) / 1000,
-        intervalSeconds: (now - lastChunkPerfRef.current) / 1000,
-        bytes: e.data.size,
-      };
-      lastChunkPerfRef.current = now;
       if (e.data.size === 0) {
-        stats.empty += 1;
-        console.error("[MediaRecorder] chunk vacío", { ...chunkEvent, timecode: e.timecode });
+        console.error("[MediaRecorder] el fragmento final está vacío", {
+          timecode: e.timecode,
+          recorderState: rec.state,
+        });
       } else {
-        chunksRef.current.push(e.data);
-        if (!stoppingRef.current && e.data.size < 10_240) {
-          stats.small += 1;
-          console.warn("[MediaRecorder] chunk anormalmente pequeño", {
-            index: stats.total,
-            bytes: e.data.size,
-            timecode: e.timecode,
-            elapsedSeconds: chunkEvent.elapsedSeconds,
-            intervalSeconds: chunkEvent.intervalSeconds,
-          });
-        }
+        finalChunkRef.current = e.data;
       }
-      console.info("[MediaRecorder] ondataavailable", {
-        ...chunkEvent,
+      console.info("[MediaRecorder] ondataavailable final", {
+        bytes: e.data.size,
         timecode: e.timecode,
         recorderState: rec.state,
       });
-      setChunkEvents((events) => [...events, chunkEvent]);
-      setChunkInfo(
-        `${stats.total} chunks · ${stats.empty} vacíos · ${stats.small} pequeños · último ${fmtMB(e.data.size)}`,
-      );
     };
     rec.onerror = (e) => {
       console.error("[MediaRecorder] error", e);
       setRecLog(`Error del grabador: ${String((e as unknown as { error?: Error }).error ?? e)}`);
     };
     rec.onstop = async () => {
-      if (dataRequestIntervalRef.current !== null) {
-        window.clearInterval(dataRequestIntervalRef.current);
-        dataRequestIntervalRef.current = null;
-      }
-      dataRequestGuardRef.current = false;
       const durationMs = Date.now() - startTsRef.current;
-      let blob = new Blob(chunksRef.current, { type: mimeType ?? "video/webm" });
-      chunksRef.current = [];
-      const stats = chunkStatsRef.current;
-      let log = `onstop OK · ${chunkCountLabel(blob)} · ${fmtMB(blob.size)} · ${Math.round(durationMs / 1000)}s · ${stats.total} chunks (${stats.empty} vacíos, ${stats.small} pequeños)`;
+      const finalChunk = finalChunkRef.current;
+      finalChunkRef.current = null;
+      recorderRef.current = null;
+      if (!finalChunk || finalChunk.size === 0) {
+        const log = "onstop recibido, pero el único fragmento final está vacío";
+        console.error("[Grabación]", log);
+        setRecLog(log);
+        setFinalizing(false);
+        return;
+      }
+      let blob = new Blob([finalChunk], { type: mimeType ?? finalChunk.type ?? "video/webm" });
+      let log = `onstop OK · chunk final único · ${chunkCountLabel(blob)} · ${fmtMB(blob.size)} · ${Math.round(durationMs / 1000)}s`;
       if (isWebm) {
         try {
           const { default: fixWebmDuration } = await import("fix-webm-duration");
@@ -552,24 +518,16 @@ function RecordPage() {
     recorderRef.current = rec;
     startTsRef.current = Date.now();
     startPerfRef.current = performance.now();
-    lastChunkPerfRef.current = startPerfRef.current;
-    lastDataRequestPerfRef.current = Number.NEGATIVE_INFINITY;
-    dataRequestGuardRef.current = false;
     rec.start();
-    dataRequestIntervalRef.current = window.setInterval(() => {
-      if (rec.state === "recording" && !stoppingRef.current) {
-        requestRecorderData(rec, "intervalo");
-      }
-    }, DATA_REQUEST_INTERVAL_MS);
     startingRef.current = false;
     console.info("[MediaRecorder] start", {
       timesliceMs: null,
-      manualRequestIntervalMs: DATA_REQUEST_INTERVAL_MS,
+      manualRequestData: false,
       mimeType: rec.mimeType,
       videoBitsPerSecond: rec.videoBitsPerSecond,
       audioBitsPerSecond: rec.audioBitsPerSecond,
     });
-    setRecLog(`Grabando · start() + requestData cada ${DATA_REQUEST_INTERVAL_MS / 1000} s`);
+    setRecLog("Grabando en flujo continuo · sin chunks intermedios");
     setElapsed(0);
     setRecording(true);
     setScrolling(true);
@@ -588,21 +546,9 @@ function RecordPage() {
     releaseWakeLock();
     if (!rec || stoppingRef.current || rec.state === "inactive") return;
     stoppingRef.current = true;
-    if (dataRequestIntervalRef.current !== null) {
-      window.clearInterval(dataRequestIntervalRef.current);
-      dataRequestIntervalRef.current = null;
-    }
     setFinalizing(true);
     setRecLog("Cerrando archivo… no cierres la pantalla");
-    const sinceLastRequest = performance.now() - lastDataRequestPerfRef.current;
-    const finalRequestDelay = Math.max(0, DATA_REQUEST_MIN_GAP_MS - sinceLastRequest);
-    window.setTimeout(() => {
-      if (rec.state === "recording") {
-        requestRecorderData(rec, "final");
-        rec.stop();
-      }
-      recorderRef.current = null;
-    }, finalRequestDelay);
+    rec.stop();
   }
 
   const title = script?.title ?? "";
@@ -614,7 +560,7 @@ function RecordPage() {
         playsInline
         muted
         autoPlay
-        className="absolute inset-0 size-full object-cover"
+        className="absolute inset-0 size-full object-contain"
         style={{ transform: prefs.facingMode === "user" ? "scaleX(-1)" : undefined }}
       />
 
@@ -751,26 +697,13 @@ function RecordPage() {
 
       {recording && (
         <div className="pointer-events-none absolute inset-x-3 top-[calc(env(safe-area-inset-top,0px)+5.75rem)] z-10 flex justify-center">
-          <div className="max-h-[30svh] w-full max-w-md overflow-hidden rounded-lg bg-glass-strong px-3 py-2 text-[10px] text-muted-foreground backdrop-blur">
+          <div className="w-full max-w-md rounded-lg bg-glass-strong px-3 py-2 text-[10px] text-muted-foreground backdrop-blur">
             <p className="text-center font-semibold text-foreground">
-              {activeMime || "Códec predeterminado"} · requestData manual / 2 s
+              Grabando… {elapsed}s transcurridos
             </p>
-            <p className="mt-0.5 text-center">{chunkInfo || "Esperando primer chunk"}</p>
-            <div className="mt-1 space-y-0.5 font-mono tabular-nums">
-              {chunkEvents.length === 0 ? (
-                <p className="text-center">Primer fragmento esperado cerca de 2,00 s</p>
-              ) : (
-                chunkEvents.slice(-8).map((chunk) => (
-                  <p
-                    key={chunk.index}
-                    className={chunk.bytes === 0 ? "font-bold text-destructive" : ""}
-                  >
-                    Chunk {chunk.index}: seg {chunk.elapsedSeconds.toFixed(2)} ·{" "}
-                    {fmtChunkSize(chunk.bytes)} · intervalo {chunk.intervalSeconds.toFixed(2)} s
-                  </p>
-                ))
-              )}
-            </div>
+            <p className="mt-0.5 text-center">
+              {activeMime || "Códec predeterminado"} · flujo continuo sin cortes
+            </p>
           </div>
         </div>
       )}
@@ -859,7 +792,6 @@ function RecordPage() {
                   )
                   .join(" · ") || "—"}
               </p>
-              {chunkInfo && <p className="break-words">Chunks: {chunkInfo}</p>}
               {recLog && <p className="break-words text-foreground">Estado: {recLog}</p>}
             </div>
           </div>
