@@ -64,7 +64,8 @@ type ChunkEvent = {
   bytes: number;
 };
 
-const RECORDER_TIMESLICE_MS = 2_000;
+const DATA_REQUEST_INTERVAL_MS = 2_000;
+const DATA_REQUEST_MIN_GAP_MS = 500;
 
 function mediaErrorDetails(error: unknown) {
   if (error instanceof DOMException || error instanceof Error) {
@@ -155,6 +156,9 @@ function RecordPage() {
   const startTsRef = useRef(0);
   const startPerfRef = useRef(0);
   const lastChunkPerfRef = useRef(0);
+  const dataRequestIntervalRef = useRef<number | null>(null);
+  const dataRequestGuardRef = useRef(false);
+  const lastDataRequestPerfRef = useRef(Number.NEGATIVE_INFINITY);
   const trackRef = useRef<HTMLDivElement>(null);
   const offsetRef = useRef(0);
   const rafRef = useRef<number | null>(null);
@@ -381,6 +385,16 @@ function RecordPage() {
 
   useEffect(() => () => void releaseWakeLock(), [releaseWakeLock]);
 
+  useEffect(
+    () => () => {
+      if (dataRequestIntervalRef.current !== null) {
+        window.clearInterval(dataRequestIntervalRef.current);
+        dataRequestIntervalRef.current = null;
+      }
+    },
+    [],
+  );
+
   function resetScroll() {
     offsetRef.current = 0;
     if (trackRef.current) trackRef.current.style.transform = "translate3d(0,0,0)";
@@ -389,6 +403,42 @@ function RecordPage() {
   function updatePrefs(patch: Partial<Prefs>) {
     setPrefs((p) => ({ ...p, ...patch }));
     savePrefs(patch);
+  }
+
+  function requestRecorderData(rec: MediaRecorder, reason: "intervalo" | "final") {
+    const now = performance.now();
+    const sinceLastRequest = now - lastDataRequestPerfRef.current;
+    if (
+      rec.state !== "recording" ||
+      dataRequestGuardRef.current ||
+      sinceLastRequest < DATA_REQUEST_MIN_GAP_MS
+    ) {
+      console.warn("[MediaRecorder] requestData omitido por protección", {
+        reason,
+        recorderState: rec.state,
+        guardActive: dataRequestGuardRef.current,
+        sinceLastRequestMs: Math.round(sinceLastRequest),
+      });
+      return false;
+    }
+
+    dataRequestGuardRef.current = true;
+    lastDataRequestPerfRef.current = now;
+    try {
+      rec.requestData();
+      console.info("[MediaRecorder] requestData manual", {
+        reason,
+        elapsedSeconds: (now - startPerfRef.current) / 1000,
+      });
+      return true;
+    } catch (err) {
+      console.error("[MediaRecorder] requestData falló", { reason, err });
+      return false;
+    } finally {
+      window.setTimeout(() => {
+        dataRequestGuardRef.current = false;
+      }, 100);
+    }
   }
 
   async function beginRecording() {
@@ -474,6 +524,11 @@ function RecordPage() {
       setRecLog(`Error del grabador: ${String((e as unknown as { error?: Error }).error ?? e)}`);
     };
     rec.onstop = async () => {
+      if (dataRequestIntervalRef.current !== null) {
+        window.clearInterval(dataRequestIntervalRef.current);
+        dataRequestIntervalRef.current = null;
+      }
+      dataRequestGuardRef.current = false;
       const durationMs = Date.now() - startTsRef.current;
       let blob = new Blob(chunksRef.current, { type: mimeType ?? "video/webm" });
       chunksRef.current = [];
@@ -498,15 +553,23 @@ function RecordPage() {
     startTsRef.current = Date.now();
     startPerfRef.current = performance.now();
     lastChunkPerfRef.current = startPerfRef.current;
-    rec.start(RECORDER_TIMESLICE_MS);
+    lastDataRequestPerfRef.current = Number.NEGATIVE_INFINITY;
+    dataRequestGuardRef.current = false;
+    rec.start();
+    dataRequestIntervalRef.current = window.setInterval(() => {
+      if (rec.state === "recording" && !stoppingRef.current) {
+        requestRecorderData(rec, "intervalo");
+      }
+    }, DATA_REQUEST_INTERVAL_MS);
     startingRef.current = false;
     console.info("[MediaRecorder] start", {
-      timesliceMs: RECORDER_TIMESLICE_MS,
+      timesliceMs: null,
+      manualRequestIntervalMs: DATA_REQUEST_INTERVAL_MS,
       mimeType: rec.mimeType,
       videoBitsPerSecond: rec.videoBitsPerSecond,
       audioBitsPerSecond: rec.audioBitsPerSecond,
     });
-    setRecLog(`Grabando · start(${RECORDER_TIMESLICE_MS} ms)`);
+    setRecLog(`Grabando · start() + requestData cada ${DATA_REQUEST_INTERVAL_MS / 1000} s`);
     setElapsed(0);
     setRecording(true);
     setScrolling(true);
@@ -525,15 +588,21 @@ function RecordPage() {
     releaseWakeLock();
     if (!rec || stoppingRef.current || rec.state === "inactive") return;
     stoppingRef.current = true;
+    if (dataRequestIntervalRef.current !== null) {
+      window.clearInterval(dataRequestIntervalRef.current);
+      dataRequestIntervalRef.current = null;
+    }
     setFinalizing(true);
     setRecLog("Cerrando archivo… no cierres la pantalla");
-    try {
-      rec.requestData();
-    } catch {
-      /* ignore */
-    }
-    rec.stop();
-    recorderRef.current = null;
+    const sinceLastRequest = performance.now() - lastDataRequestPerfRef.current;
+    const finalRequestDelay = Math.max(0, DATA_REQUEST_MIN_GAP_MS - sinceLastRequest);
+    window.setTimeout(() => {
+      if (rec.state === "recording") {
+        requestRecorderData(rec, "final");
+        rec.stop();
+      }
+      recorderRef.current = null;
+    }, finalRequestDelay);
   }
 
   const title = script?.title ?? "";
@@ -684,7 +753,7 @@ function RecordPage() {
         <div className="pointer-events-none absolute inset-x-3 top-[calc(env(safe-area-inset-top,0px)+5.75rem)] z-10 flex justify-center">
           <div className="max-h-[30svh] w-full max-w-md overflow-hidden rounded-lg bg-glass-strong px-3 py-2 text-[10px] text-muted-foreground backdrop-blur">
             <p className="text-center font-semibold text-foreground">
-              {activeMime || "Códec predeterminado"} · start({RECORDER_TIMESLICE_MS} ms)
+              {activeMime || "Códec predeterminado"} · requestData manual / 2 s
             </p>
             <p className="mt-0.5 text-center">{chunkInfo || "Esperando primer chunk"}</p>
             <div className="mt-1 space-y-0.5 font-mono tabular-nums">
