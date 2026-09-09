@@ -132,6 +132,8 @@ function RecordPage() {
   const [finalizing, setFinalizing] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const drawRafRef = useRef<number | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const finalChunkRef = useRef<Blob | null>(null);
@@ -146,6 +148,7 @@ function RecordPage() {
   const wakeRef = useRef<WakeLockSentinel | null>(null);
   const speedRef = useRef(prefs.speed);
   speedRef.current = prefs.speed;
+
 
   useEffect(() => {
     const s = getScript(id);
@@ -174,27 +177,17 @@ function RecordPage() {
 
   const startCamera = useCallback(
     async (facing: "user" | "environment", audioDeviceId: string, useDiagnosticMode: boolean) => {
-      const portraitWidth = useDiagnosticMode ? 720 : 1080;
-      const portraitHeight = useDiagnosticMode ? 1280 : 1920;
       const orientationType = window.screen.orientation?.type ?? "desconocida";
-      const screenIsLandscape = orientationType.startsWith("landscape");
-      const fallbackWidth = screenIsLandscape ? portraitHeight : portraitWidth;
-      const fallbackHeight = screenIsLandscape ? portraitWidth : portraitHeight;
-      const exactVideoConstraints: MediaStreamConstraints = {
+      // Ya no forzamos aspectRatio ni width/height según orientación de pantalla:
+      // el navegador negocia lo que el sensor entregue de forma nativa, y el
+      // recorte/orientación final correctos se resuelven en el <canvas> antes
+      // de grabar, no aquí. Esto evita OverconstrainedError y comportamiento
+      // errático al girar el móvil.
+      const videoConstraints: MediaStreamConstraints = {
         video: {
           facingMode: facing,
-          aspectRatio: { exact: 9 / 16 },
-          width: { ideal: portraitWidth },
-          height: { ideal: portraitHeight },
-          frameRate: { ideal: 30 },
-        },
-      };
-      const fallbackVideoConstraints: MediaStreamConstraints = {
-        video: {
-          facingMode: facing,
-          aspectRatio: { ideal: 9 / 16 },
-          width: { ideal: fallbackWidth },
-          height: { ideal: fallbackHeight },
+          width: { ideal: 1920 },
+          height: { ideal: 1920 },
           frameRate: { ideal: 30 },
         },
       };
@@ -218,48 +211,18 @@ function RecordPage() {
 
       let videoStream: MediaStream;
       try {
-        videoStream = await navigator.mediaDevices.getUserMedia(exactVideoConstraints);
+        videoStream = await navigator.mediaDevices.getUserMedia(videoConstraints);
       } catch (err) {
         const name = err instanceof DOMException || err instanceof Error ? err.name : "";
-        if (name === "OverconstrainedError") {
-          console.warn("[Cámara] 9:16 exacto no disponible; usando fallback", {
-            exactVideoConstraints,
-            fallbackVideoConstraints,
-            orientationType,
-            err,
-          });
-          try {
-            videoStream = await navigator.mediaDevices.getUserMedia(fallbackVideoConstraints);
-          } catch (fallbackError) {
-            const details = mediaErrorDetails(fallbackError);
-            console.error("[Cámara] fallback de getUserMedia falló", {
-              constraints: fallbackVideoConstraints,
-              orientationType,
-              err: fallbackError,
-            });
-            const fallbackName =
-              fallbackError instanceof DOMException || fallbackError instanceof Error
-                ? fallbackError.name
-                : "";
-            setPerm(
-              fallbackName === "NotAllowedError" || fallbackName === "SecurityError"
-                ? "denied"
-                : "error",
-            );
-            setPermMsg(`9:16 exacto no compatible. Fallback: ${details}`);
-            return;
-          }
-        } else {
-          const details = mediaErrorDetails(err);
-          console.error("[Cámara] getUserMedia falló", {
-            constraints: exactVideoConstraints,
-            orientationType,
-            err,
-          });
-          setPerm(name === "NotAllowedError" || name === "SecurityError" ? "denied" : "error");
-          setPermMsg(details);
-          return;
-        }
+        const details = mediaErrorDetails(err);
+        console.error("[Cámara] getUserMedia falló", {
+          constraints: videoConstraints,
+          orientationType,
+          err,
+        });
+        setPerm(name === "NotAllowedError" || name === "SecurityError" ? "denied" : "error");
+        setPermMsg(details);
+        return;
       }
 
       let audioStream: MediaStream | null = null;
@@ -343,6 +306,54 @@ function RecordPage() {
       streamRef.current?.getTracks().forEach((t) => t.stop());
     };
   }, [startCamera]);
+
+  // Dibuja continuamente el fotograma actual de la cámara en el canvas oculto,
+  // recortando siempre a proporción 9:16 vertical y aplicando el espejo aquí
+  // (no en CSS), para que lo que se GRABA sea idéntico a lo que se VE, sin
+  // depender de que el sensor del teléfono negocie bien la orientación.
+  useEffect(() => {
+    if (perm !== "ready") return;
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || !canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const draw = () => {
+      const vw = video.videoWidth;
+      const vh = video.videoHeight;
+      if (vw && vh) {
+        const targetW = canvas.width;
+        const targetH = canvas.height;
+        const targetRatio = targetW / targetH;
+        const srcRatio = vw / vh;
+        let sx: number, sy: number, sw: number, sh: number;
+        if (srcRatio > targetRatio) {
+          // Fuente más ancha que el objetivo: recorta los laterales.
+          sh = vh;
+          sw = vh * targetRatio;
+          sx = (vw - sw) / 2;
+          sy = 0;
+        } else {
+          // Fuente más alta/estrecha que el objetivo: recorta arriba/abajo.
+          sw = vw;
+          sh = vw / targetRatio;
+          sx = 0;
+          sy = (vh - sh) / 2;
+        }
+        // Sin espejo aquí a propósito: el archivo grabado debe reflejar la
+        // escena real (como antes con el stream crudo). El espejo del
+        // <video> de previsualización es solo comodidad visual en pantalla.
+        ctx.drawImage(video, sx, sy, sw, sh, 0, 0, targetW, targetH);
+      }
+      drawRafRef.current = requestAnimationFrame(draw);
+    };
+    drawRafRef.current = requestAnimationFrame(draw);
+    return () => {
+      if (drawRafRef.current) cancelAnimationFrame(drawRafRef.current);
+      drawRafRef.current = null;
+    };
+  }, [perm]);
 
   useEffect(() => {
     const onChange = () => refreshDevices();
@@ -430,8 +441,9 @@ function RecordPage() {
   }
 
   async function beginRecording() {
-    const stream = streamRef.current;
-    if (!stream || startingRef.current || recorderRef.current) return;
+    const previewStream = streamRef.current;
+    const canvas = canvasRef.current;
+    if (!previewStream || !canvas || startingRef.current || recorderRef.current) return;
     startingRef.current = true;
     if (downloadUrl) URL.revokeObjectURL(downloadUrl);
     setDownloadUrl(null);
@@ -444,7 +456,7 @@ function RecordPage() {
     }
     setCountdown(null);
 
-    if (!stream.active) {
+    if (!previewStream.active) {
       startingRef.current = false;
       setRecLog("La cámara dejó de estar activa durante la cuenta atrás.");
       return;
@@ -456,13 +468,22 @@ function RecordPage() {
     setDownloadExt(isWebm ? "webm" : "mp4");
     finalChunkRef.current = null;
     stoppingRef.current = false;
-    const vset = stream.getVideoTracks()[0]?.getSettings();
-    const pixels = (vset?.width ?? 1920) * (vset?.height ?? 1080);
-    const fps = vset?.frameRate ?? 30;
+
+    // Grabamos el canvas (ya recortado a 9:16 y con el espejo aplicado en el
+    // propio dibujo), combinado con el audio real del micrófono — así el
+    // archivo final es idéntico a lo que se ve en pantalla, sin depender de
+    // la orientación nativa que negocie el sensor de la cámara.
+    const canvasStream = canvas.captureStream(30);
+    const combinedStream = new MediaStream([
+      ...canvasStream.getVideoTracks(),
+      ...previewStream.getAudioTracks(),
+    ]);
+    const pixels = canvas.width * canvas.height;
+    const fps = 30;
     const videoBitsPerSecond = diagnosticMode
       ? 4_000_000
       : Math.min(24_000_000, Math.max(8_000_000, Math.round(pixels * fps * 0.07)));
-    const rec = new MediaRecorder(stream, {
+    const rec = new MediaRecorder(combinedStream, {
       ...(mimeType ? { mimeType } : {}),
       videoBitsPerSecond,
       audioBitsPerSecond: 192_000,
@@ -562,6 +583,15 @@ function RecordPage() {
         autoPlay
         className="absolute inset-0 size-full object-contain"
         style={{ transform: prefs.facingMode === "user" ? "scaleX(-1)" : undefined }}
+      />
+      {/* Canvas oculto: aquí se dibuja el fotograma ya recortado a 9:16 y con
+          el espejo correcto aplicado. Es lo que realmente se graba. */}
+      <canvas
+        ref={canvasRef}
+        width={diagnosticMode ? 720 : 1080}
+        height={diagnosticMode ? 1280 : 1920}
+        className="hidden"
+        aria-hidden="true"
       />
 
       {/* Teleprompter overlay */}
@@ -779,7 +809,11 @@ function RecordPage() {
             </label>
             <div className="mt-3 space-y-1 text-xs text-muted-foreground">
               <p>Perfil: {diagnosticMode ? "Prueba VP8 720p / 4 Mbps" : "Vertical 1080×1920"}</p>
-              <p>Vídeo: {videoInfo || "—"}</p>
+              <p>
+                Grabación real: {diagnosticMode ? "720×1280" : "1080×1920"} · vertical (canvas,
+                fijo)
+              </p>
+              <p>Sensor cámara: {videoInfo || "—"}</p>
               <p>Zoom: {zoomInfo || "—"}</p>
               <p className="truncate">Micrófono: {audioLabel || "—"}</p>
               <p className="break-words">Códec activo: {activeMime || "Se decidirá al grabar"}</p>
