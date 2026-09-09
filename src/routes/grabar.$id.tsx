@@ -126,6 +126,8 @@ function RecordPage() {
   const [downloadExt, setDownloadExt] = useState("webm");
   const [showPanel, setShowPanel] = useState(true);
   const [recLog, setRecLog] = useState("");
+  const [canvasHealth, setCanvasHealth] = useState("");
+  const [postCheck, setPostCheck] = useState("");
   const [diagnosticMode, setDiagnosticMode] = useState(false);
   const [codecSupport, setCodecSupport] = useState<ReturnType<typeof getCodecSupport>>([]);
   const [activeMime, setActiveMime] = useState("");
@@ -134,6 +136,8 @@ function RecordPage() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const drawRafRef = useRef<number | null>(null);
+  const lastDrawTsRef = useRef(0);
+  const drawFrameCountRef = useRef(0);
   const streamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const finalChunkRef = useRef<Blob | null>(null);
@@ -187,7 +191,7 @@ function RecordPage() {
         video: {
           facingMode: facing,
           width: { ideal: 1920 },
-          height: { ideal: 1920 },
+          height: { ideal: 1080 },
           frameRate: { ideal: 30 },
         },
       };
@@ -320,6 +324,8 @@ function RecordPage() {
     if (!ctx) return;
 
     const draw = () => {
+      lastDrawTsRef.current = performance.now();
+      drawFrameCountRef.current += 1;
       const vw = video.videoWidth;
       const vh = video.videoHeight;
       if (vw && vh) {
@@ -401,6 +407,36 @@ function RecordPage() {
     return () => window.clearInterval(t);
   }, [recording]);
 
+  // VIGILANTE DEL CANVAS: mientras se graba, comprueba cada segundo si el
+  // bucle de dibujo (requestAnimationFrame) sigue produciendo fotogramas
+  // nuevos. Si pasan más de 800ms sin un nuevo dibujo, lo señala de forma
+  // visible — esto confirmaría si la congelación de vídeo viene de aquí.
+  useEffect(() => {
+    if (!recording) {
+      setCanvasHealth("");
+      return;
+    }
+    const startFrames = drawFrameCountRef.current;
+    const startTime = performance.now();
+    let framesAtLastCheck = startFrames;
+    const watchdog = window.setInterval(() => {
+      const now = performance.now();
+      const sinceLastDraw = now - lastDrawTsRef.current;
+      const currentFrames = drawFrameCountRef.current;
+      const fps = currentFrames - framesAtLastCheck; // comprobación cada 1s
+      framesAtLastCheck = currentFrames;
+      if (sinceLastDraw > 800) {
+        const msg = `⚠ CANVAS CONGELADO: sin fotogramas nuevos desde hace ${Math.round(sinceLastDraw)}ms (frame #${currentFrames})`;
+        console.error("[Canvas watchdog]", msg);
+        setCanvasHealth(msg);
+      } else {
+        setCanvasHealth(`Canvas OK · ~${fps} fps · frame #${currentFrames}`);
+      }
+    }, 1000);
+    console.info("[Canvas watchdog] iniciado", { startFrames, startTime });
+    return () => window.clearInterval(watchdog);
+  }, [recording]);
+
   const releaseWakeLock = useCallback(async () => {
     try {
       await wakeRef.current?.release();
@@ -447,6 +483,7 @@ function RecordPage() {
     startingRef.current = true;
     if (downloadUrl) URL.revokeObjectURL(downloadUrl);
     setDownloadUrl(null);
+    setPostCheck("");
     resetScroll();
     setShowPanel(false);
 
@@ -533,8 +570,37 @@ function RecordPage() {
       }
       console.info("[Grabación]", log);
       setRecLog(log);
-      setDownloadUrl(URL.createObjectURL(blob));
+      const url = URL.createObjectURL(blob);
+      setDownloadUrl(url);
       setFinalizing(false);
+
+      // COMPROBACIÓN POST-GRABACIÓN: dejamos que el propio navegador decodifique
+      // el archivo final para ver qué duración de VÍDEO detecta realmente, y lo
+      // comparamos con la duración total grabada (audio+reloj). Si el vídeo
+      // decodificado dura mucho menos que la grabación real, confirma que el
+      // vídeo dejó de generarse en algún punto aunque el archivo siga "creciendo".
+      const probe = document.createElement("video");
+      probe.preload = "metadata";
+      probe.src = url;
+      probe.onloadedmetadata = () => {
+        const decodedDuration = probe.duration;
+        const expectedSeconds = Math.round(durationMs / 1000);
+        const diff = expectedSeconds - decodedDuration;
+        const verdict =
+          Number.isFinite(decodedDuration) && diff > 3
+            ? `⚠ EL VÍDEO SE CORTA ANTES: decodificado ${decodedDuration.toFixed(1)}s de los ${expectedSeconds}s grabados (faltan ${diff.toFixed(1)}s de vídeo real)`
+            : `Duración decodificada OK: ${Number.isFinite(decodedDuration) ? decodedDuration.toFixed(1) : "?"}s de ${expectedSeconds}s grabados`;
+        console.info("[Comprobación post-grabación]", {
+          decodedDuration,
+          expectedSeconds,
+          videoWidth: probe.videoWidth,
+          videoHeight: probe.videoHeight,
+        });
+        setPostCheck(verdict);
+      };
+      probe.onerror = () => {
+        setPostCheck("⚠ El propio navegador no pudo leer metadatos del archivo generado");
+      };
     };
     recorderRef.current = rec;
     startTsRef.current = Date.now();
@@ -585,12 +651,17 @@ function RecordPage() {
         style={{ transform: prefs.facingMode === "user" ? "scaleX(-1)" : undefined }}
       />
       {/* Canvas oculto: aquí se dibuja el fotograma ya recortado a 9:16 y con
-          el espejo correcto aplicado. Es lo que realmente se graba. */}
+          el espejo correcto aplicado. Es lo que realmente se graba.
+          IMPORTANTE: no usar display:none (clase "hidden" de Tailwind) — en
+          varios navegadores móviles eso saca el elemento del árbol de
+          renderizado y canvas.captureStream() deja de recibir fotogramas
+          reales, produciendo un archivo vacío desde el segundo 0. Lo sacamos
+          de la vista con posición absoluta fuera de pantalla en su lugar. */}
       <canvas
         ref={canvasRef}
         width={diagnosticMode ? 720 : 1080}
         height={diagnosticMode ? 1280 : 1920}
-        className="hidden"
+        className="pointer-events-none absolute left-[-99999px] top-0 opacity-0"
         aria-hidden="true"
       />
 
@@ -734,6 +805,15 @@ function RecordPage() {
             <p className="mt-0.5 text-center">
               {activeMime || "Códec predeterminado"} · flujo continuo sin cortes
             </p>
+            {canvasHealth && (
+              <p
+                className={`mt-0.5 text-center font-semibold ${
+                  canvasHealth.startsWith("⚠") ? "text-red-400" : "text-emerald-400"
+                }`}
+              >
+                {canvasHealth}
+              </p>
+            )}
           </div>
         </div>
       )}
@@ -827,6 +907,15 @@ function RecordPage() {
                   .join(" · ") || "—"}
               </p>
               {recLog && <p className="break-words text-foreground">Estado: {recLog}</p>}
+              {postCheck && (
+                <p
+                  className={`break-words font-semibold ${
+                    postCheck.startsWith("⚠") ? "text-red-400" : "text-emerald-400"
+                  }`}
+                >
+                  {postCheck}
+                </p>
+              )}
             </div>
           </div>
         )}
