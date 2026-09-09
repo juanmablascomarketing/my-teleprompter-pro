@@ -511,8 +511,23 @@ function RecordPage() {
     // archivo final es idéntico a lo que se ve en pantalla, sin depender de
     // la orientación nativa que negocie el sensor de la cámara.
     const canvasStream = canvas.captureStream(30);
+    const canvasVideoTrack = canvasStream.getVideoTracks()[0];
+    console.info("[Canvas captureStream]", {
+      trackExists: !!canvasVideoTrack,
+      readyState: canvasVideoTrack?.readyState,
+      enabled: canvasVideoTrack?.enabled,
+      muted: canvasVideoTrack?.muted,
+      settings: canvasVideoTrack?.getSettings(),
+    });
+    if (!canvasVideoTrack || canvasVideoTrack.readyState !== "live") {
+      setRecLog(
+        `⚠ El track de vídeo del canvas no está activo (readyState: ${canvasVideoTrack?.readyState ?? "sin track"}). No se iniciará la grabación.`,
+      );
+      startingRef.current = false;
+      return;
+    }
     const combinedStream = new MediaStream([
-      ...canvasStream.getVideoTracks(),
+      canvasVideoTrack,
       ...previewStream.getAudioTracks(),
     ]);
     const pixels = canvas.width * canvas.height;
@@ -650,18 +665,17 @@ function RecordPage() {
         className="absolute inset-0 size-full object-contain"
         style={{ transform: prefs.facingMode === "user" ? "scaleX(-1)" : undefined }}
       />
-      {/* Canvas oculto: aquí se dibuja el fotograma ya recortado a 9:16 y con
-          el espejo correcto aplicado. Es lo que realmente se graba.
-          IMPORTANTE: no usar display:none (clase "hidden" de Tailwind) — en
-          varios navegadores móviles eso saca el elemento del árbol de
-          renderizado y canvas.captureStream() deja de recibir fotogramas
-          reales, produciendo un archivo vacío desde el segundo 0. Lo sacamos
-          de la vista con posición absoluta fuera de pantalla en su lugar. */}
+      {/* Miniatura del canvas de grabación: la dejamos REALMENTE visible
+          (pequeña, en una esquina) a propósito. Ocultarla con display:none
+          u off-screen ya ha causado dos veces que el navegador se salte su
+          renderizado y canvas.captureStream() entregara 0 fotogramas reales
+          — esto lo evita por completo, y de paso sirve para confirmar a
+          simple vista que el canvas está capturando lo correcto. */}
       <canvas
         ref={canvasRef}
         width={diagnosticMode ? 720 : 1080}
         height={diagnosticMode ? 1280 : 1920}
-        className="pointer-events-none absolute left-[-99999px] top-0 opacity-0"
+        className="pointer-events-none absolute bottom-24 right-3 z-20 h-24 w-auto rounded border border-white/40 shadow-lg"
         aria-hidden="true"
       />
 
