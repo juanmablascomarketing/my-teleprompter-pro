@@ -124,6 +124,7 @@ function RecordPage() {
   const [elapsed, setElapsed] = useState(0);
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const [downloadExt, setDownloadExt] = useState("webm");
+  const [downloadMeta, setDownloadMeta] = useState("");
   const [showPanel, setShowPanel] = useState(true);
   const [recLog, setRecLog] = useState("");
   const [postCheck, setPostCheck] = useState("");
@@ -132,10 +133,18 @@ function RecordPage() {
   const [activeMime, setActiveMime] = useState("");
   const [finalizing, setFinalizing] = useState(false);
 
+  // GRABACIÓN CON RecordRTC: tras confirmar que MediaRecorder nativo (con
+  // distintos códecs, bitrates, resoluciones, fotogramas clave forzados y
+  // grabación por tramos) no produce un archivo decodificable en este
+  // dispositivo para duraciones largas, pasamos a una librería especializada
+  // y ampliamente usada (RecordRTC) que gestiona internamente estas
+  // incompatibilidades de Android/Chrome para grabaciones continuas largas,
+  // en vez de seguir ajustando la API nativa a mano.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const recordRTCRef = useRef<any>(null);
+
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const recorderRef = useRef<MediaRecorder | null>(null);
-  const finalChunkRef = useRef<Blob | null>(null);
   const startingRef = useRef(false);
   const stoppingRef = useRef(false);
   const startTsRef = useRef(0);
@@ -395,10 +404,11 @@ function RecordPage() {
 
   async function beginRecording() {
     const previewStream = streamRef.current;
-    if (!previewStream || startingRef.current || recorderRef.current) return;
+    if (!previewStream || startingRef.current || recordRTCRef.current) return;
     startingRef.current = true;
     if (downloadUrl) URL.revokeObjectURL(downloadUrl);
     setDownloadUrl(null);
+    setDownloadMeta("");
     setPostCheck("");
     resetScroll();
     setShowPanel(false);
@@ -415,25 +425,7 @@ function RecordPage() {
       return;
     }
 
-    const mimeType = pickMime(diagnosticMode);
-    const isWebm = !mimeType?.includes("mp4");
-    setActiveMime(mimeType ?? "Predeterminado del navegador");
-    setDownloadExt(isWebm ? "webm" : "mp4");
-    finalChunkRef.current = null;
-    stoppingRef.current = false;
-
-    // Grabamos el stream REAL de la cámara directamente (no un canvas
-    // intermedio). El intento anterior de grabar vía canvas.captureStream()
-    // resultó ser una regresión: producía 0.0s de vídeo decodificable incluso
-    // en clips de 8 segundos, peor que el comportamiento original. Volvemos
-    // al enfoque que sabíamos que funcionaba para clips cortos, ahora
-    // combinado con las constraints de cámara ya corregidas (sin forzar
-    // proporciones imposibles), que por sí solas ya arreglaron el encuadre.
     const videoTrack = previewStream.getVideoTracks()[0];
-    console.info("[Cámara] track de vídeo real", {
-      readyState: videoTrack?.readyState,
-      settings: videoTrack?.getSettings(),
-    });
     if (!videoTrack || videoTrack.readyState !== "live") {
       setRecLog(
         `⚠ El track de vídeo de la cámara no está activo (readyState: ${videoTrack?.readyState ?? "sin track"}). No se iniciará la grabación.`,
@@ -447,122 +439,83 @@ function RecordPage() {
     const videoBitsPerSecond = diagnosticMode
       ? 4_000_000
       : Math.min(24_000_000, Math.max(8_000_000, Math.round(pixels * fps * 0.07)));
-    const rec = new MediaRecorder(previewStream, {
-      ...(mimeType ? { mimeType } : {}),
+
+    setActiveMime("RecordRTC · vp8");
+    setDownloadExt("webm");
+    stoppingRef.current = false;
+
+    const { default: RecordRTC, MediaStreamRecorder } = await import("recordrtc");
+    // RecordRTC gestiona internamente el trocear y volver a unir la grabación
+    // de forma segura para Android/Chrome, que es justo la parte que
+    // fallaba al hacerlo a mano con MediaRecorder — timeSlice aquí es
+    // manejado por la propia librería de forma fiable, no por nuestro código.
+    const recorder = new RecordRTC(previewStream, {
+      type: "video",
+      mimeType: "video/webm;codecs=vp8,opus",
+      recorderType: MediaStreamRecorder,
       videoBitsPerSecond,
       audioBitsPerSecond: 192_000,
+      disableLogs: true,
+      timeSlice: 3000,
+      checkForInactiveTracks: true,
     });
-    rec.ondataavailable = (e) => {
-      if (e.data.size === 0) {
-        console.error("[MediaRecorder] el fragmento final está vacío", {
-          timecode: e.timecode,
-          recorderState: rec.state,
-        });
-      } else {
-        finalChunkRef.current = e.data;
-      }
-      console.info("[MediaRecorder] ondataavailable final", {
-        bytes: e.data.size,
-        timecode: e.timecode,
-        recorderState: rec.state,
-      });
-    };
-    rec.onerror = (e) => {
-      console.error("[MediaRecorder] error", e);
-      setRecLog(`Error del grabador: ${String((e as unknown as { error?: Error }).error ?? e)}`);
-    };
-    rec.onstop = async () => {
-      const durationMs = Date.now() - startTsRef.current;
-      const finalChunk = finalChunkRef.current;
-      finalChunkRef.current = null;
-      recorderRef.current = null;
-      if (!finalChunk || finalChunk.size === 0) {
-        const log = "onstop recibido, pero el único fragmento final está vacío";
-        console.error("[Grabación]", log);
-        setRecLog(log);
-        setFinalizing(false);
-        return;
-      }
-      let blob = new Blob([finalChunk], { type: mimeType ?? finalChunk.type ?? "video/webm" });
-      let log = `onstop OK · chunk final único · ${chunkCountLabel(blob)} · ${fmtMB(blob.size)} · ${Math.round(durationMs / 1000)}s`;
-      if (isWebm) {
-        try {
-          const { default: fixWebmDuration } = await import("fix-webm-duration");
-          blob = await fixWebmDuration(blob, durationMs, { logger: false });
-          log += " · duración WebM reparada";
-        } catch (err) {
-          console.error("[WebM] no se pudo reparar la duración", err);
-          log += " · aviso: duración WebM sin reparar";
-        }
-      }
-      console.info("[Grabación]", log);
-      setRecLog(log);
-      const url = URL.createObjectURL(blob);
-      setDownloadUrl(url);
-      setFinalizing(false);
-
-      // COMPROBACIÓN POST-GRABACIÓN: dejamos que el propio navegador decodifique
-      // el archivo final para ver qué duración de VÍDEO detecta realmente, y lo
-      // comparamos con la duración total grabada (audio+reloj). Si el vídeo
-      // decodificado dura mucho menos que la grabación real, confirma que el
-      // vídeo dejó de generarse en algún punto aunque el archivo siga "creciendo".
-      const probe = document.createElement("video");
-      probe.preload = "metadata";
-      probe.src = url;
-      probe.onloadedmetadata = () => {
-        const decodedDuration = probe.duration;
-        const expectedSeconds = Math.round(durationMs / 1000);
-        const diff = expectedSeconds - decodedDuration;
-        const verdict =
-          Number.isFinite(decodedDuration) && diff > 3
-            ? `⚠ EL VÍDEO SE CORTA ANTES: decodificado ${decodedDuration.toFixed(1)}s de los ${expectedSeconds}s grabados (faltan ${diff.toFixed(1)}s de vídeo real)`
-            : `Duración decodificada OK: ${Number.isFinite(decodedDuration) ? decodedDuration.toFixed(1) : "?"}s de ${expectedSeconds}s grabados`;
-        console.info("[Comprobación post-grabación]", {
-          decodedDuration,
-          expectedSeconds,
-          videoWidth: probe.videoWidth,
-          videoHeight: probe.videoHeight,
-        });
-        setPostCheck(verdict);
-      };
-      probe.onerror = () => {
-        setPostCheck("⚠ El propio navegador no pudo leer metadatos del archivo generado");
-      };
-    };
-    recorderRef.current = rec;
+    recordRTCRef.current = recorder;
     startTsRef.current = Date.now();
     startPerfRef.current = performance.now();
-    rec.start();
+    recorder.startRecording();
     startingRef.current = false;
-    console.info("[MediaRecorder] start", {
-      timesliceMs: null,
-      manualRequestData: false,
-      mimeType: rec.mimeType,
-      videoBitsPerSecond: rec.videoBitsPerSecond,
-      audioBitsPerSecond: rec.audioBitsPerSecond,
-    });
-    setRecLog("Grabando en flujo continuo · sin chunks intermedios");
+    setRecLog("Grabando con RecordRTC…");
     setElapsed(0);
     setRecording(true);
     setScrolling(true);
     requestWakeLock();
   }
 
-  function chunkCountLabel(blob: Blob) {
-    return blob.type || "video/webm";
-  }
-
   function stopRecording() {
-    const rec = recorderRef.current;
+    const recorder = recordRTCRef.current;
     setRecording(false);
     setScrolling(false);
     setShowPanel(true);
     releaseWakeLock();
-    if (!rec || stoppingRef.current || rec.state === "inactive") return;
+    if (!recorder || stoppingRef.current) return;
     stoppingRef.current = true;
     setFinalizing(true);
-    setRecLog("Cerrando archivo… no cierres la pantalla");
-    rec.stop();
+    setRecLog("Cerrando el archivo… no cierres la pantalla");
+    const durationMs = Date.now() - startTsRef.current;
+    recorder.stopRecording(() => {
+      const blob: Blob = recorder.getBlob();
+      recordRTCRef.current = null;
+      stoppingRef.current = false;
+      if (!blob || blob.size === 0) {
+        setRecLog("⚠ RecordRTC no generó ningún dato");
+        setFinalizing(false);
+        return;
+      }
+      const url = URL.createObjectURL(blob);
+      const seconds = Math.round(durationMs / 1000);
+      setDownloadUrl(url);
+      setDownloadMeta(`${seconds}s · ${fmtMB(blob.size)}`);
+      setRecLog(`Grabación finalizada · ${seconds}s · ${fmtMB(blob.size)}`);
+      setFinalizing(false);
+
+      // Misma comprobación que antes: dejamos que el propio navegador
+      // decodifique el archivo para confirmar cuánto vídeo real contiene.
+      const probe = document.createElement("video");
+      probe.preload = "metadata";
+      probe.src = url;
+      probe.onloadedmetadata = () => {
+        const decoded = probe.duration;
+        const diff = seconds - decoded;
+        const verdict =
+          Number.isFinite(decoded) && diff > 3
+            ? `⚠ EL VÍDEO SE CORTA ANTES: decodificado ${decoded.toFixed(1)}s de los ${seconds}s grabados`
+            : `✓ Duración decodificada OK: ${Number.isFinite(decoded) ? decoded.toFixed(1) : "?"}s de ${seconds}s`;
+        setPostCheck(verdict);
+      };
+      probe.onerror = () => {
+        setPostCheck("⚠ El navegador no pudo leer metadatos del archivo generado");
+      };
+    });
   }
 
   const title = script?.title ?? "";
@@ -888,6 +841,9 @@ function RecordPage() {
               className="grid size-14 shrink-0 place-items-center rounded-full bg-primary text-primary-foreground"
             >
               <Download className="size-6" />
+              {downloadMeta && (
+                <span className="sr-only">{downloadMeta}</span>
+              )}
             </a>
           ) : (
             <Button
