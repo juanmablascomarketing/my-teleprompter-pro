@@ -126,7 +126,6 @@ function RecordPage() {
   const [downloadExt, setDownloadExt] = useState("webm");
   const [showPanel, setShowPanel] = useState(true);
   const [recLog, setRecLog] = useState("");
-  const [canvasHealth, setCanvasHealth] = useState("");
   const [postCheck, setPostCheck] = useState("");
   const [diagnosticMode, setDiagnosticMode] = useState(false);
   const [codecSupport, setCodecSupport] = useState<ReturnType<typeof getCodecSupport>>([]);
@@ -134,10 +133,6 @@ function RecordPage() {
   const [finalizing, setFinalizing] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const drawRafRef = useRef<number | null>(null);
-  const lastDrawTsRef = useRef(0);
-  const drawFrameCountRef = useRef(0);
   const streamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const finalChunkRef = useRef<Blob | null>(null);
@@ -311,55 +306,7 @@ function RecordPage() {
     };
   }, [startCamera]);
 
-  // Dibuja continuamente el fotograma actual de la cámara en el canvas oculto,
-  // recortando siempre a proporción 9:16 vertical y aplicando el espejo aquí
-  // (no en CSS), para que lo que se GRABA sea idéntico a lo que se VE, sin
-  // depender de que el sensor del teléfono negocie bien la orientación.
-  useEffect(() => {
-    if (perm !== "ready") return;
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    if (!video || !canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
 
-    const draw = () => {
-      lastDrawTsRef.current = performance.now();
-      drawFrameCountRef.current += 1;
-      const vw = video.videoWidth;
-      const vh = video.videoHeight;
-      if (vw && vh) {
-        const targetW = canvas.width;
-        const targetH = canvas.height;
-        const targetRatio = targetW / targetH;
-        const srcRatio = vw / vh;
-        let sx: number, sy: number, sw: number, sh: number;
-        if (srcRatio > targetRatio) {
-          // Fuente más ancha que el objetivo: recorta los laterales.
-          sh = vh;
-          sw = vh * targetRatio;
-          sx = (vw - sw) / 2;
-          sy = 0;
-        } else {
-          // Fuente más alta/estrecha que el objetivo: recorta arriba/abajo.
-          sw = vw;
-          sh = vw / targetRatio;
-          sx = 0;
-          sy = (vh - sh) / 2;
-        }
-        // Sin espejo aquí a propósito: el archivo grabado debe reflejar la
-        // escena real (como antes con el stream crudo). El espejo del
-        // <video> de previsualización es solo comodidad visual en pantalla.
-        ctx.drawImage(video, sx, sy, sw, sh, 0, 0, targetW, targetH);
-      }
-      drawRafRef.current = requestAnimationFrame(draw);
-    };
-    drawRafRef.current = requestAnimationFrame(draw);
-    return () => {
-      if (drawRafRef.current) cancelAnimationFrame(drawRafRef.current);
-      drawRafRef.current = null;
-    };
-  }, [perm]);
 
   useEffect(() => {
     const onChange = () => refreshDevices();
@@ -407,36 +354,6 @@ function RecordPage() {
     return () => window.clearInterval(t);
   }, [recording]);
 
-  // VIGILANTE DEL CANVAS: mientras se graba, comprueba cada segundo si el
-  // bucle de dibujo (requestAnimationFrame) sigue produciendo fotogramas
-  // nuevos. Si pasan más de 800ms sin un nuevo dibujo, lo señala de forma
-  // visible — esto confirmaría si la congelación de vídeo viene de aquí.
-  useEffect(() => {
-    if (!recording) {
-      setCanvasHealth("");
-      return;
-    }
-    const startFrames = drawFrameCountRef.current;
-    const startTime = performance.now();
-    let framesAtLastCheck = startFrames;
-    const watchdog = window.setInterval(() => {
-      const now = performance.now();
-      const sinceLastDraw = now - lastDrawTsRef.current;
-      const currentFrames = drawFrameCountRef.current;
-      const fps = currentFrames - framesAtLastCheck; // comprobación cada 1s
-      framesAtLastCheck = currentFrames;
-      if (sinceLastDraw > 800) {
-        const msg = `⚠ CANVAS CONGELADO: sin fotogramas nuevos desde hace ${Math.round(sinceLastDraw)}ms (frame #${currentFrames})`;
-        console.error("[Canvas watchdog]", msg);
-        setCanvasHealth(msg);
-      } else {
-        setCanvasHealth(`Canvas OK · ~${fps} fps · frame #${currentFrames}`);
-      }
-    }, 1000);
-    console.info("[Canvas watchdog] iniciado", { startFrames, startTime });
-    return () => window.clearInterval(watchdog);
-  }, [recording]);
-
   const releaseWakeLock = useCallback(async () => {
     try {
       await wakeRef.current?.release();
@@ -478,8 +395,7 @@ function RecordPage() {
 
   async function beginRecording() {
     const previewStream = streamRef.current;
-    const canvas = canvasRef.current;
-    if (!previewStream || !canvas || startingRef.current || recorderRef.current) return;
+    if (!previewStream || startingRef.current || recorderRef.current) return;
     startingRef.current = true;
     if (downloadUrl) URL.revokeObjectURL(downloadUrl);
     setDownloadUrl(null);
@@ -506,36 +422,32 @@ function RecordPage() {
     finalChunkRef.current = null;
     stoppingRef.current = false;
 
-    // Grabamos el canvas (ya recortado a 9:16 y con el espejo aplicado en el
-    // propio dibujo), combinado con el audio real del micrófono — así el
-    // archivo final es idéntico a lo que se ve en pantalla, sin depender de
-    // la orientación nativa que negocie el sensor de la cámara.
-    const canvasStream = canvas.captureStream(30);
-    const canvasVideoTrack = canvasStream.getVideoTracks()[0];
-    console.info("[Canvas captureStream]", {
-      trackExists: !!canvasVideoTrack,
-      readyState: canvasVideoTrack?.readyState,
-      enabled: canvasVideoTrack?.enabled,
-      muted: canvasVideoTrack?.muted,
-      settings: canvasVideoTrack?.getSettings(),
+    // Grabamos el stream REAL de la cámara directamente (no un canvas
+    // intermedio). El intento anterior de grabar vía canvas.captureStream()
+    // resultó ser una regresión: producía 0.0s de vídeo decodificable incluso
+    // en clips de 8 segundos, peor que el comportamiento original. Volvemos
+    // al enfoque que sabíamos que funcionaba para clips cortos, ahora
+    // combinado con las constraints de cámara ya corregidas (sin forzar
+    // proporciones imposibles), que por sí solas ya arreglaron el encuadre.
+    const videoTrack = previewStream.getVideoTracks()[0];
+    console.info("[Cámara] track de vídeo real", {
+      readyState: videoTrack?.readyState,
+      settings: videoTrack?.getSettings(),
     });
-    if (!canvasVideoTrack || canvasVideoTrack.readyState !== "live") {
+    if (!videoTrack || videoTrack.readyState !== "live") {
       setRecLog(
-        `⚠ El track de vídeo del canvas no está activo (readyState: ${canvasVideoTrack?.readyState ?? "sin track"}). No se iniciará la grabación.`,
+        `⚠ El track de vídeo de la cámara no está activo (readyState: ${videoTrack?.readyState ?? "sin track"}). No se iniciará la grabación.`,
       );
       startingRef.current = false;
       return;
     }
-    const combinedStream = new MediaStream([
-      canvasVideoTrack,
-      ...previewStream.getAudioTracks(),
-    ]);
-    const pixels = canvas.width * canvas.height;
-    const fps = 30;
+    const vset = videoTrack.getSettings();
+    const pixels = (vset.width ?? 1080) * (vset.height ?? 1920);
+    const fps = vset.frameRate ?? 30;
     const videoBitsPerSecond = diagnosticMode
       ? 4_000_000
       : Math.min(24_000_000, Math.max(8_000_000, Math.round(pixels * fps * 0.07)));
-    const rec = new MediaRecorder(combinedStream, {
+    const rec = new MediaRecorder(previewStream, {
       ...(mimeType ? { mimeType } : {}),
       videoBitsPerSecond,
       audioBitsPerSecond: 192_000,
@@ -664,19 +576,6 @@ function RecordPage() {
         autoPlay
         className="absolute inset-0 size-full object-contain"
         style={{ transform: prefs.facingMode === "user" ? "scaleX(-1)" : undefined }}
-      />
-      {/* Miniatura del canvas de grabación: la dejamos REALMENTE visible
-          (pequeña, en una esquina) a propósito. Ocultarla con display:none
-          u off-screen ya ha causado dos veces que el navegador se salte su
-          renderizado y canvas.captureStream() entregara 0 fotogramas reales
-          — esto lo evita por completo, y de paso sirve para confirmar a
-          simple vista que el canvas está capturando lo correcto. */}
-      <canvas
-        ref={canvasRef}
-        width={diagnosticMode ? 720 : 1080}
-        height={diagnosticMode ? 1280 : 1920}
-        className="pointer-events-none absolute bottom-24 right-3 z-20 h-24 w-auto rounded border border-white/40 shadow-lg"
-        aria-hidden="true"
       />
 
       {/* Teleprompter overlay */}
@@ -819,15 +718,6 @@ function RecordPage() {
             <p className="mt-0.5 text-center">
               {activeMime || "Códec predeterminado"} · flujo continuo sin cortes
             </p>
-            {canvasHealth && (
-              <p
-                className={`mt-0.5 text-center font-semibold ${
-                  canvasHealth.startsWith("⚠") ? "text-red-400" : "text-emerald-400"
-                }`}
-              >
-                {canvasHealth}
-              </p>
-            )}
           </div>
         </div>
       )}
@@ -903,11 +793,7 @@ function RecordPage() {
             </label>
             <div className="mt-3 space-y-1 text-xs text-muted-foreground">
               <p>Perfil: {diagnosticMode ? "Prueba VP8 720p / 4 Mbps" : "Vertical 1080×1920"}</p>
-              <p>
-                Grabación real: {diagnosticMode ? "720×1280" : "1080×1920"} · vertical (canvas,
-                fijo)
-              </p>
-              <p>Sensor cámara: {videoInfo || "—"}</p>
+              <p>Vídeo: {videoInfo || "—"} (stream real de la cámara)</p>
               <p>Zoom: {zoomInfo || "—"}</p>
               <p className="truncate">Micrófono: {audioLabel || "—"}</p>
               <p className="break-words">Códec activo: {activeMime || "Se decidirá al grabar"}</p>
